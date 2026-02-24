@@ -1,0 +1,15 @@
+[project]
+name = "ingest-sessions"
+version = "0.1.0"
+description = "Ingest Claude Code session transcripts into DuckDB for analysis"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.0",
+]
+
+[project.scripts]
+ingest-sessions = "ingest_sessions:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
