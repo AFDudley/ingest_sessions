@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["duckdb"]
+# ///
 """Ingest Claude Code session transcripts into DuckDB for analysis.
 
 Supports named profiles in ~/.config/ingest_sessions/profiles.toml
@@ -56,13 +60,9 @@ def resolve_project_dirs(projects_spec: str | list[str]) -> list[Path]:
 
 
 def create_tables(db: duckdb.DuckDBPyConnection) -> None:
-    """Create the schema (drops existing tables)."""
-    db.execute("DROP TABLE IF EXISTS history")
-    db.execute("DROP TABLE IF EXISTS records")
-    db.execute("DROP TABLE IF EXISTS sessions")
-
+    """Create the schema if it doesn't exist."""
     db.execute("""
-        CREATE TABLE sessions (
+        CREATE TABLE IF NOT EXISTS sessions (
             session_id VARCHAR PRIMARY KEY,
             summary VARCHAR,
             first_prompt VARCHAR,
@@ -74,7 +74,7 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
         )
     """)
     db.execute("""
-        CREATE TABLE records (
+        CREATE TABLE IF NOT EXISTS records (
             uuid VARCHAR PRIMARY KEY,
             session_id VARCHAR,
             type VARCHAR,
@@ -84,7 +84,7 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
         )
     """)
     db.execute("""
-        CREATE TABLE history (
+        CREATE TABLE IF NOT EXISTS history (
             timestamp BIGINT,
             display VARCHAR,
             session_id VARCHAR,

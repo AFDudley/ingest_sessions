@@ -1,15 +1,24 @@
 [project]
 name = "ingest-sessions"
-version = "0.1.0"
-description = "Ingest Claude Code session transcripts into DuckDB for analysis"
+version = "0.2.0"
+description = "MCP server for querying Claude Code session transcripts via DuckDB"
 requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.0",
+    "mcp>=1.0",
+    "watchdog>=4.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
 ]
 
 [project.scripts]
-ingest-sessions = "ingest_sessions:main"
+ingest-sessions = "ingest_sessions.cli:main"
+ingest-sessions-server = "ingest_sessions.server:cli"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
