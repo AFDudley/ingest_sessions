@@ -88,7 +88,8 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
             timestamp BIGINT,
             display VARCHAR,
             session_id VARCHAR,
-            project VARCHAR
+            project VARCHAR,
+            PRIMARY KEY (timestamp, session_id)
         )
     """)
 
@@ -121,14 +122,16 @@ def load_jsonl_session(
         if not line.strip():
             continue
         record = json.loads(line)
-        batch.append((
-            record.get("uuid", ""),
-            record.get("sessionId", session_id),
-            record.get("type", ""),
-            record.get("timestamp"),
-            record.get("parentUuid"),
-            line,
-        ))
+        batch.append(
+            (
+                record.get("uuid", ""),
+                record.get("sessionId", session_id),
+                record.get("type", ""),
+                record.get("timestamp"),
+                record.get("parentUuid"),
+                line,
+            )
+        )
 
     if batch:
         db.executemany(
@@ -171,15 +174,17 @@ def load_history(
         if filter_lower and filter_lower not in line.lower():
             continue
         entry = json.loads(line)
-        batch.append((
-            entry.get("timestamp"),
-            entry.get("display"),
-            entry.get("sessionId"),
-            entry.get("project"),
-        ))
+        batch.append(
+            (
+                entry.get("timestamp"),
+                entry.get("display"),
+                entry.get("sessionId"),
+                entry.get("project"),
+            )
+        )
 
     if batch:
-        db.executemany("INSERT INTO history VALUES (?, ?, ?, ?)", batch)
+        db.executemany("INSERT OR IGNORE INTO history VALUES (?, ?, ?, ?)", batch)
     return len(batch)
 
 
@@ -241,8 +246,10 @@ def ingest(config: dict[str, Any]) -> None:
     db.execute("CREATE INDEX idx_history_session ON history(session_id)")
 
     # Summary
-    print(f"\nLoaded {total_sessions} sessions, {total_records} records, "
-          f"{history_count} history entries")
+    print(
+        f"\nLoaded {total_sessions} sessions, {total_records} records, "
+        f"{history_count} history entries"
+    )
 
     print("\nRecords by type:")
     for row in db.execute(
@@ -261,7 +268,8 @@ def main() -> None:
         description="Ingest Claude Code sessions into DuckDB",
     )
     parser.add_argument(
-        "profile", nargs="?",
+        "profile",
+        nargs="?",
         help="Named profile from ~/.config/ingest_sessions/profiles.toml",
     )
     parser.add_argument(
@@ -271,7 +279,8 @@ def main() -> None:
     parser.add_argument("--filter", help="Case-insensitive content filter")
     parser.add_argument("--output", help="Output DuckDB path")
     parser.add_argument(
-        "--no-history", action="store_true",
+        "--no-history",
+        action="store_true",
         help="Skip history.jsonl ingestion",
     )
     args = parser.parse_args()
@@ -283,8 +292,7 @@ def main() -> None:
 
     if args.projects is not None:
         config["projects"] = (
-            args.projects if args.projects == "*"
-            else args.projects.split(",")
+            args.projects if args.projects == "*" else args.projects.split(",")
         )
     if args.filter is not None:
         config["filter"] = args.filter

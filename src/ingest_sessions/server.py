@@ -10,6 +10,8 @@ sequentially.  DuckDB does not allow mixing read-only and read-write
 connections in the same process, so one thread, one connection, one queue.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -26,8 +28,11 @@ from mcp.server.stdio import stdio_server
 from mcp.types import AnyUrl, Resource, TextContent, Tool
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+from watchdog.observers.api import BaseObserver
 
-DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "ingest_sessions" / "sessions.duckdb"
+DEFAULT_DB_PATH = (
+    Path.home() / ".local" / "share" / "ingest_sessions" / "sessions.duckdb"
+)
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 DEFAULT_HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
 DEFAULT_PORT = 8741
@@ -43,10 +48,12 @@ server = Server("ingest-sessions")
 @dataclass
 class _DbRequest:
     """A unit of work for the database thread."""
+
     fn: Callable[[duckdb.DuckDBPyConnection], Any]
     done: threading.Event = field(default_factory=threading.Event)
     result: Any = None
     error: Exception | None = None
+    wait: bool = True
 
 
 # None is the shutdown sentinel.
@@ -75,6 +82,7 @@ async def _db_execute(fn: Callable[[duckdb.DuckDBPyConnection], Any]) -> Any:
 # Configuration helpers
 # ---------------------------------------------------------------------------
 
+
 def _db_path() -> str:
     return os.environ.get("INGEST_SESSIONS_DB", str(DEFAULT_DB_PATH))
 
@@ -96,6 +104,30 @@ def _history_file() -> Path:
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
+
+
+def _migrate_history_pk(db: duckdb.DuckDBPyConnection) -> None:
+    """Add primary key to history table if missing (migration for existing DBs)."""
+    constraints = db.execute(
+        "SELECT constraint_type FROM information_schema.table_constraints "
+        "WHERE table_name = 'history' AND constraint_type = 'PRIMARY KEY'"
+    ).fetchall()
+    if constraints:
+        return
+    db.execute("CREATE TABLE history_new AS SELECT DISTINCT * FROM history")
+    db.execute("DROP TABLE history")
+    db.execute("""
+        CREATE TABLE history (
+            timestamp BIGINT,
+            display VARCHAR,
+            session_id VARCHAR,
+            project VARCHAR,
+            PRIMARY KEY (timestamp, session_id)
+        )
+    """)
+    db.execute("INSERT OR IGNORE INTO history SELECT * FROM history_new")
+    db.execute("DROP TABLE history_new")
+
 
 def _create_tables(db: duckdb.DuckDBPyConnection) -> None:
     """Create the schema and indexes if they don't exist."""
@@ -126,19 +158,26 @@ def _create_tables(db: duckdb.DuckDBPyConnection) -> None:
             timestamp BIGINT,
             display VARCHAR,
             session_id VARCHAR,
-            project VARCHAR
+            project VARCHAR,
+            PRIMARY KEY (timestamp, session_id)
         )
     """)
+    _migrate_history_pk(db)
     # Indexes per DESIGN.md
-    db.execute("CREATE INDEX IF NOT EXISTS idx_records_session_id ON records(session_id)")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_records_session_id ON records(session_id)"
+    )
     db.execute("CREATE INDEX IF NOT EXISTS idx_records_type ON records(type)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_records_timestamp ON records(timestamp)")
-    db.execute("CREATE INDEX IF NOT EXISTS idx_history_session_id ON history(session_id)")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_history_session_id ON history(session_id)"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Session metadata
 # ---------------------------------------------------------------------------
+
 
 def _build_session_metadata(project_dirs: list[Path]) -> dict[str, dict[str, Any]]:
     """Build a lookup of session metadata from sessions-index.json files."""
@@ -153,21 +192,9 @@ def _build_session_metadata(project_dirs: list[Path]) -> dict[str, dict[str, Any
     return meta
 
 
-def _build_session_metadata_for_file(jsonl_path: Path) -> dict[str, dict[str, Any]]:
-    """Build session metadata lookup scoped to a single file's parent dir."""
-    proj_dir = jsonl_path.parent
-    idx_file = proj_dir / "sessions-index.json"
-    if not idx_file.exists():
-        return {}
-    idx = json.loads(idx_file.read_text())
-    meta: dict[str, dict[str, Any]] = {}
-    for entry in idx.get("entries", []):
-        meta[entry["sessionId"]] = entry
-    return meta
-
-
 def _derive_session_metadata(
-    db: duckdb.DuckDBPyConnection, session_id: str,
+    db: duckdb.DuckDBPyConnection,
+    session_id: str,
 ) -> None:
     """Derive session metadata from ingested records when no index exists."""
     row = db.execute(
@@ -198,12 +225,14 @@ def _derive_session_metadata(
     if first_user:
         try:
             record = json.loads(first_user[0])
+        except json.JSONDecodeError:
+            record = None
+        if isinstance(record, dict):
             msg = record.get("message", {})
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                first_prompt = content[:500]
-        except (json.JSONDecodeError, AttributeError):
-            pass
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    first_prompt = content[:500]
 
     db.execute(
         "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -240,6 +269,7 @@ def _ingest_session_metadata(
 # Ingestion — called only from the database thread.
 # ---------------------------------------------------------------------------
 
+
 def _ingest_jsonl(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
     """Ingest a single JSONL session file. Returns record count."""
     text = jsonl_path.read_text()
@@ -248,15 +278,20 @@ def _ingest_jsonl(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
     for line in text.splitlines():
         if not line.strip():
             continue
-        record = json.loads(line)
-        batch.append((
-            record.get("uuid", ""),
-            record.get("sessionId", session_id),
-            record.get("type", ""),
-            record.get("timestamp"),
-            record.get("parentUuid"),
-            line,
-        ))
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        batch.append(
+            (
+                record.get("uuid", ""),
+                record.get("sessionId", session_id),
+                record.get("type", ""),
+                record.get("timestamp"),
+                record.get("parentUuid"),
+                line,
+            )
+        )
     if batch:
         for row in batch:
             db.execute(
@@ -270,7 +305,7 @@ def _ingest_file_full(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
     """Ingest records AND session metadata for a single JSONL file."""
     session_id = jsonl_path.stem
     count = _ingest_jsonl(db, jsonl_path)
-    session_meta = _build_session_metadata_for_file(jsonl_path)
+    session_meta = _build_session_metadata([jsonl_path.parent])
     _ingest_session_metadata(db, session_id, session_meta)
     return count
 
@@ -285,14 +320,16 @@ def _ingest_history(db: duckdb.DuckDBPyConnection) -> int:
         if not line.strip():
             continue
         entry = json.loads(line)
-        batch.append((
-            entry.get("timestamp"),
-            entry.get("display"),
-            entry.get("sessionId"),
-            entry.get("project"),
-        ))
+        batch.append(
+            (
+                entry.get("timestamp"),
+                entry.get("display"),
+                entry.get("sessionId"),
+                entry.get("project"),
+            )
+        )
     if batch:
-        db.executemany("INSERT INTO history VALUES (?, ?, ?, ?)", batch)
+        db.executemany("INSERT OR IGNORE INTO history VALUES (?, ?, ?, ?)", batch)
     return len(batch)
 
 
@@ -318,6 +355,7 @@ def _ingest_all(db: duckdb.DuckDBPyConnection) -> None:
 # Database thread
 # ---------------------------------------------------------------------------
 
+
 def _db_loop() -> None:
     """Single database thread.  Owns the connection, drains the queue."""
     path = _db_path()
@@ -337,6 +375,11 @@ def _db_loop() -> None:
             except Exception as exc:
                 req.error = exc
             req.done.set()
+            if not req.wait and req.error:
+                print(
+                    f"[ingest-sessions] background db error: {req.error}",
+                    file=sys.stderr,
+                )
     finally:
         db.close()
 
@@ -360,6 +403,7 @@ def _stop_db_thread() -> None:
 # Watchdog
 # ---------------------------------------------------------------------------
 
+
 class _JsonlHandler(FileSystemEventHandler):
     """Watchdog handler that enqueues new/modified JSONL files."""
 
@@ -376,10 +420,12 @@ class _JsonlHandler(FileSystemEventHandler):
         if path.suffix != ".jsonl":
             return
         # Fire-and-forget: enqueue, don't wait.
-        _db_submit(lambda db, p=path: _ingest_file_full(db, p))
+        captured = path
+        req = _db_submit(lambda db: _ingest_file_full(db, captured))
+        req.wait = False
 
 
-def _start_watcher() -> Observer:
+def _start_watcher() -> BaseObserver:
     """Start watchdog observer on the projects directory."""
     projects_dir = _projects_dir()
     projects_dir.mkdir(parents=True, exist_ok=True)
@@ -390,14 +436,15 @@ def _start_watcher() -> Observer:
     return observer
 
 
-def _startup() -> Observer | None:
+def _startup() -> BaseObserver | None:
     """Run on server start: start database thread, start watcher."""
     global _db_thread
+    _startup_done.clear()
     _db_thread = _start_db_thread()
     return _start_watcher()
 
 
-def _shutdown(observer: Observer | None) -> None:
+def _shutdown(observer: BaseObserver | None) -> None:
     """Clean shutdown: stop watcher, stop database thread."""
     if observer:
         observer.stop()
@@ -409,8 +456,9 @@ def _shutdown(observer: Observer | None) -> None:
 # MCP tools
 # ---------------------------------------------------------------------------
 
+
 @server.list_tools()
-async def list_tools():
+async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="query",
@@ -444,7 +492,7 @@ async def list_tools():
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict):
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     if name == "query":
         sql = arguments["sql"]
 
@@ -462,9 +510,14 @@ async def call_tool(name: str, arguments: dict):
     if name == "refresh":
         jsonl_path = Path(arguments["path"])
         if not jsonl_path.exists():
-            return [TextContent(type="text", text=json.dumps({"error": f"File not found: {jsonl_path}"}))]
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": f"File not found: {jsonl_path}"}),
+                )
+            ]
         count = await _db_execute(lambda db: _ingest_file_full(db, jsonl_path))
-        return [TextContent(type="text", text=json.dumps({"ingested": count}))]
+        return [TextContent(type="text", text=json.dumps({"processed": count}))]
 
     raise ValueError(f"Unknown tool: {name}")
 
@@ -477,7 +530,7 @@ SCHEMA_URI = "ingest-sessions://schema"
 
 
 @server.list_resources()
-async def list_resources():
+async def list_resources() -> list[Resource]:
     return [
         Resource(
             uri=AnyUrl(SCHEMA_URI),
@@ -489,7 +542,7 @@ async def list_resources():
 
 
 @server.read_resource()
-async def read_resource(uri: AnyUrl):
+async def read_resource(uri: AnyUrl) -> str:
     if str(uri) == SCHEMA_URI:
 
         def get_schema(db: duckdb.DuckDBPyConnection) -> str:
@@ -518,6 +571,7 @@ async def read_resource(uri: AnyUrl):
 # ---------------------------------------------------------------------------
 # Transports
 # ---------------------------------------------------------------------------
+
 
 async def run_stdio() -> None:
     """Run in stdio mode (single client, good for testing)."""
@@ -552,7 +606,7 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
     async def handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
         await session_manager.handle_request(scope, receive, send)
 
-    observer: Observer | None = None
+    observer: BaseObserver | None = None
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
@@ -576,6 +630,7 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+
 async def main() -> None:
     """Default entrypoint — stdio for backward compat."""
     await run_stdio()
@@ -594,9 +649,18 @@ def cli() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="ingest-sessions MCP server")
-    parser.add_argument("--stdio", action="store_true", help="Run in stdio mode (single client)")
-    parser.add_argument("--host", default="127.0.0.1", help="HTTP listen address (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=None, help=f"HTTP listen port (default: {DEFAULT_PORT})")
+    parser.add_argument(
+        "--stdio", action="store_true", help="Run in stdio mode (single client)"
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="HTTP listen address (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"HTTP listen port (default: {DEFAULT_PORT})",
+    )
     args = parser.parse_args()
 
     if args.stdio:
