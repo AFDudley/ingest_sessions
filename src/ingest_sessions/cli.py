@@ -3,33 +3,63 @@
 # requires-python = ">=3.11"
 # dependencies = ["duckdb"]
 # ///
-"""Ingest Claude Code session transcripts into DuckDB for analysis.
+"""Batch ingest Claude Code session transcripts into DuckDB.
 
 Supports named profiles in ~/.config/ingest_sessions/profiles.toml
-and ad-hoc CLI overrides. See README or --help for usage.
+and ad-hoc CLI overrides.  See README or --help for usage.
+
+This is the one-shot batch tool.  For the long-running MCP server,
+see ingest_sessions.server.
 """
 
+from __future__ import annotations
+
 import argparse
-import json
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import duckdb
 
-CLAUDE_DIR = Path.home() / ".claude"
-PROJECTS_DIR = CLAUDE_DIR / "projects"
-HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
-CONFIG_FILE = Path.home() / ".config" / "ingest_sessions" / "profiles.toml"
+from ingest_sessions.core import (
+    build_session_metadata,
+    create_tables,
+    ingest_history,
+    ingest_jsonl,
+    ingest_session_metadata,
+)
+
+
+def _claude_dir() -> Path:
+    return Path.home() / ".claude"
+
+
+def _config_file() -> Path:
+    return Path.home() / ".config" / "ingest_sessions" / "profiles.toml"
+
+
+@dataclass
+class IngestConfig:
+    """Configuration for a batch ingestion run."""
+
+    output: Path
+    projects: str | list[str] = "*"
+    content_filter: str | None = None
+    include_history: bool = True
 
 
 def load_profile(name: str) -> dict[str, Any]:
-    """Load a named profile from the TOML config file."""
-    if not CONFIG_FILE.exists():
-        print(f"Config file not found: {CONFIG_FILE}", file=sys.stderr)
+    """Load a named profile from the TOML config file.
+
+    Raises SystemExit if the config file or profile is missing.
+    """
+    config_file = _config_file()
+    if not config_file.exists():
+        print(f"Config file not found: {config_file}", file=sys.stderr)
         sys.exit(1)
-    profiles = tomllib.loads(CONFIG_FILE.read_text())
+    profiles = tomllib.loads(config_file.read_text())
     if name not in profiles:
         available = ", ".join(profiles.keys())
         print(f"Profile '{name}' not found. Available: {available}", file=sys.stderr)
@@ -43,170 +73,40 @@ def resolve_project_dirs(projects_spec: str | list[str]) -> list[Path]:
     Args:
         projects_spec: Either "*" for all projects, or a list of project
             directory names under ~/.claude/projects/.
+
+    Raises:
+        ValueError: If a named project directory doesn't exist or the spec
+            is invalid.
     """
+    projects_dir = _claude_dir() / "projects"
     if projects_spec == "*":
-        return sorted(d for d in PROJECTS_DIR.iterdir() if d.is_dir())
+        return sorted(d for d in projects_dir.iterdir() if d.is_dir())
     if isinstance(projects_spec, list):
         dirs: list[Path] = []
         for name in projects_spec:
-            d = PROJECTS_DIR / name
+            d = projects_dir / name
             if not d.is_dir():
-                print(f"Project dir not found: {d}", file=sys.stderr)
-                sys.exit(1)
+                raise ValueError(f"Project dir not found: {d}")
             dirs.append(d)
         return dirs
-    print(f"Invalid projects spec: {projects_spec!r}", file=sys.stderr)
-    sys.exit(1)
+    raise ValueError(f"Invalid projects spec: {projects_spec!r}")
 
 
-def create_tables(db: duckdb.DuckDBPyConnection) -> None:
-    """Create the schema if it doesn't exist."""
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id VARCHAR PRIMARY KEY,
-            summary VARCHAR,
-            first_prompt VARCHAR,
-            message_count INTEGER,
-            created TIMESTAMP,
-            modified TIMESTAMP,
-            git_branch VARCHAR,
-            project_path VARCHAR
-        )
-    """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS records (
-            uuid VARCHAR PRIMARY KEY,
-            session_id VARCHAR,
-            type VARCHAR,
-            timestamp TIMESTAMP,
-            parent_uuid VARCHAR,
-            raw JSON
-        )
-    """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            timestamp BIGINT,
-            display VARCHAR,
-            session_id VARCHAR,
-            project VARCHAR,
-            PRIMARY KEY (timestamp, session_id)
-        )
-    """)
-
-
-def build_session_metadata(project_dirs: list[Path]) -> dict[str, dict[str, Any]]:
-    """Build a lookup of session metadata from sessions-index.json files."""
-    meta: dict[str, dict[str, Any]] = {}
-    for proj_dir in project_dirs:
-        idx_file = proj_dir / "sessions-index.json"
-        if not idx_file.exists():
-            continue
-        idx = json.loads(idx_file.read_text())
-        for entry in idx.get("entries", []):
-            meta[entry["sessionId"]] = entry
-    return meta
-
-
-def load_jsonl_session(
-    db: duckdb.DuckDBPyConnection,
-    text: str,
-    session_id: str,
-    session_meta: dict[str, dict[str, Any]],
-) -> int:
-    """Load a single JSONL session's text into the database.
-
-    Returns the number of records loaded.
-    """
-    batch: list[tuple[str, str, str, str | None, str | None, str]] = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        batch.append(
-            (
-                record.get("uuid", ""),
-                record.get("sessionId", session_id),
-                record.get("type", ""),
-                record.get("timestamp"),
-                record.get("parentUuid"),
-                line,
-            )
-        )
-
-    if batch:
-        db.executemany(
-            "INSERT OR IGNORE INTO records VALUES (?, ?, ?, ?, ?, ?)",
-            batch,
-        )
-
-    # Insert session metadata (from index if available, bare ID otherwise)
-    meta = session_meta.get(session_id, {})
-    db.execute(
-        "INSERT OR IGNORE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            session_id,
-            meta.get("summary"),
-            meta.get("firstPrompt"),
-            meta.get("messageCount"),
-            meta.get("created"),
-            meta.get("modified"),
-            meta.get("gitBranch"),
-            meta.get("projectPath"),
-        ],
-    )
-
-    return len(batch)
-
-
-def load_history(
-    db: duckdb.DuckDBPyConnection,
-    content_filter: str | None,
-) -> int:
-    """Load matching entries from history.jsonl. Returns count loaded."""
-    if not HISTORY_FILE.exists():
-        return 0
-
-    filter_lower = content_filter.lower() if content_filter else None
-    batch: list[tuple[int | None, str | None, str | None, str | None]] = []
-    for line in HISTORY_FILE.read_text().splitlines():
-        if not line.strip():
-            continue
-        if filter_lower and filter_lower not in line.lower():
-            continue
-        entry = json.loads(line)
-        batch.append(
-            (
-                entry.get("timestamp"),
-                entry.get("display"),
-                entry.get("sessionId"),
-                entry.get("project"),
-            )
-        )
-
-    if batch:
-        db.executemany("INSERT OR IGNORE INTO history VALUES (?, ?, ?, ?)", batch)
-    return len(batch)
-
-
-def ingest(config: dict[str, Any]) -> None:
-    """Run the ingestion pipeline from a resolved config dict."""
-    projects_spec = config.get("projects", "*")
-    content_filter: str | None = config.get("filter")
-    output_path = Path(config["output"]).expanduser()
-    include_history: bool = config.get("include_history", True)
+def ingest(config: IngestConfig) -> None:
+    """Run the batch ingestion pipeline."""
+    output_path = config.output.expanduser()
+    filter_lower = config.content_filter.lower() if config.content_filter else None
 
     print(f"Output: {output_path}")
-    print(f"Projects: {projects_spec}")
-    if content_filter:
-        print(f"Filter: {content_filter!r} (case-insensitive)")
-
-    filter_lower = content_filter.lower() if content_filter else None
+    print(f"Projects: {config.projects}")
+    if config.content_filter:
+        print(f"Filter: {config.content_filter!r} (case-insensitive)")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     db = duckdb.connect(str(output_path))
     create_tables(db)
 
-    project_dirs = resolve_project_dirs(projects_spec)
+    project_dirs = resolve_project_dirs(config.projects)
     session_meta = build_session_metadata(project_dirs)
 
     total_sessions = 0
@@ -219,14 +119,13 @@ def ingest(config: dict[str, Any]) -> None:
 
         proj_sessions = 0
         for jsonl_path in jsonl_files:
-            session_id = jsonl_path.stem
             text = jsonl_path.read_text()
-
-            # Apply content filter
             if filter_lower and filter_lower not in text.lower():
                 continue
 
-            count = load_jsonl_session(db, text, session_id, session_meta)
+            session_id = jsonl_path.stem
+            count = ingest_jsonl(db, jsonl_path)
+            ingest_session_metadata(db, session_id, session_meta)
             total_records += count
             proj_sessions += 1
 
@@ -234,16 +133,11 @@ def ingest(config: dict[str, Any]) -> None:
             print(f"  {proj_dir.name}: {proj_sessions} sessions")
             total_sessions += proj_sessions
 
-    # History
     history_count = 0
-    if include_history:
-        history_count = load_history(db, content_filter)
-
-    # Indexes
-    db.execute("CREATE INDEX idx_records_session ON records(session_id)")
-    db.execute("CREATE INDEX idx_records_type ON records(type)")
-    db.execute("CREATE INDEX idx_records_timestamp ON records(timestamp)")
-    db.execute("CREATE INDEX idx_history_session ON history(session_id)")
+    if config.include_history:
+        history_count = ingest_history(
+            db, _claude_dir() / "history.jsonl", content_filter=config.content_filter
+        )
 
     # Summary
     print(
@@ -286,24 +180,30 @@ def main() -> None:
     args = parser.parse_args()
 
     # Build config: profile defaults + CLI overrides
-    config: dict[str, Any] = {}
+    raw: dict[str, Any] = {}
     if args.profile:
-        config = load_profile(args.profile)
+        raw = load_profile(args.profile)
 
     if args.projects is not None:
-        config["projects"] = (
+        raw["projects"] = (
             args.projects if args.projects == "*" else args.projects.split(",")
         )
     if args.filter is not None:
-        config["filter"] = args.filter
+        raw["filter"] = args.filter
     if args.output is not None:
-        config["output"] = args.output
+        raw["output"] = args.output
     if args.no_history:
-        config["include_history"] = False
+        raw["include_history"] = False
 
-    if "output" not in config:
+    if "output" not in raw:
         parser.error("--output is required (or use a profile that defines it)")
 
+    config = IngestConfig(
+        output=Path(raw["output"]),
+        projects=raw.get("projects", "*"),
+        content_filter=raw.get("filter"),
+        include_history=raw.get("include_history", True),
+    )
     ingest(config)
 
 
