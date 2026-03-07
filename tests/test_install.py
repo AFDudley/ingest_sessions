@@ -10,14 +10,19 @@ from ingest_sessions.install import (
     HOOK_DEFS,
     MCP_SERVER_NAME,
     MCP_URL,
+    SERVICE_UNIT,
     _hook_entry,
     _is_our_hook,
     check_hooks,
     check_mcp_server,
+    check_service,
     install_hooks,
     install_mcp_server,
+    install_service,
+    restart_service,
     uninstall_hooks,
     uninstall_mcp_server,
+    uninstall_service,
 )
 
 
@@ -305,3 +310,145 @@ def test_check_mcp_server_not_registered():
 
     assert status["registered"] is False
     assert status["claude_cli"] is True
+
+
+# ---------------------------------------------------------------------------
+# Systemd service tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_systemctl_active(
+    *args: Any, **kwargs: Any
+) -> subprocess.CompletedProcess[str]:
+    """Simulate systemctl --user commands with active service."""
+    cmd: list[str] = args[0]
+    if "is-active" in cmd:
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="active\n")
+    if "is-enabled" in cmd:
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="enabled\n")
+    return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+
+def _mock_systemctl_inactive(
+    *args: Any, **kwargs: Any
+) -> subprocess.CompletedProcess[str]:
+    """Simulate systemctl --user commands with inactive service."""
+    cmd: list[str] = args[0]
+    if "is-active" in cmd:
+        return subprocess.CompletedProcess(cmd, returncode=3, stdout="inactive\n")
+    if "is-enabled" in cmd:
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="disabled\n")
+    return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+
+def test_install_service_writes_unit(tmp_path: Path):
+    """install_service writes the unit file and calls daemon-reload."""
+    svc_dir = tmp_path / "systemd" / "user"
+    svc_path = svc_dir / "ingest-sessions.service"
+
+    with (
+        patch("ingest_sessions.install.SERVICE_DIR", svc_dir),
+        patch("ingest_sessions.install.SERVICE_PATH", svc_path),
+        patch("subprocess.run", side_effect=_mock_systemctl_active),
+    ):
+        result = install_service()
+
+    assert result is True
+    assert svc_path.exists()
+    assert svc_path.read_text() == SERVICE_UNIT
+
+
+def test_install_service_idempotent(tmp_path: Path):
+    """install_service returns False when unit file is unchanged."""
+    svc_dir = tmp_path / "systemd" / "user"
+    svc_dir.mkdir(parents=True)
+    svc_path = svc_dir / "ingest-sessions.service"
+    svc_path.write_text(SERVICE_UNIT)
+
+    with (
+        patch("ingest_sessions.install.SERVICE_DIR", svc_dir),
+        patch("ingest_sessions.install.SERVICE_PATH", svc_path),
+        patch("subprocess.run", side_effect=_mock_systemctl_active),
+    ):
+        result = install_service()
+
+    assert result is False
+
+
+def test_uninstall_service_removes_unit(tmp_path: Path):
+    """uninstall_service stops, disables, and removes the unit file."""
+    svc_dir = tmp_path / "systemd" / "user"
+    svc_dir.mkdir(parents=True)
+    svc_path = svc_dir / "ingest-sessions.service"
+    svc_path.write_text(SERVICE_UNIT)
+
+    with (
+        patch("ingest_sessions.install.SERVICE_DIR", svc_dir),
+        patch("ingest_sessions.install.SERVICE_PATH", svc_path),
+        patch("subprocess.run", side_effect=_mock_systemctl_active) as mock_run,
+    ):
+        result = uninstall_service()
+
+    assert result is True
+    assert not svc_path.exists()
+    cmds = [call[0][0] for call in mock_run.call_args_list]
+    assert any("stop" in cmd for cmd in cmds)
+    assert any("disable" in cmd for cmd in cmds)
+    assert any("daemon-reload" in cmd for cmd in cmds)
+
+
+def test_uninstall_service_noop_if_missing(tmp_path: Path):
+    """uninstall_service returns False when no unit file exists."""
+    svc_path = tmp_path / "nonexistent.service"
+
+    with patch("ingest_sessions.install.SERVICE_PATH", svc_path):
+        result = uninstall_service()
+
+    assert result is False
+
+
+def test_restart_service():
+    """restart_service returns True when service becomes active."""
+    with patch("subprocess.run", side_effect=_mock_systemctl_active):
+        result = restart_service()
+
+    assert result is True
+
+
+def test_restart_service_failure():
+    """restart_service returns False when service stays inactive."""
+    with patch("subprocess.run", side_effect=_mock_systemctl_inactive):
+        result = restart_service()
+
+    assert result is False
+
+
+def test_check_service_active(tmp_path: Path):
+    """check_service reports active and enabled."""
+    svc_path = tmp_path / "ingest-sessions.service"
+    svc_path.write_text(SERVICE_UNIT)
+
+    with (
+        patch("ingest_sessions.install.SERVICE_PATH", svc_path),
+        patch("subprocess.run", side_effect=_mock_systemctl_active),
+    ):
+        status = check_service()
+
+    assert status["unit_exists"] is True
+    assert status["active"] is True
+    assert status["enabled"] is True
+
+
+def test_check_service_inactive(tmp_path: Path):
+    """check_service reports inactive when service is not running."""
+    svc_path = tmp_path / "nonexistent.service"
+
+    with (
+        patch("ingest_sessions.install.SERVICE_PATH", svc_path),
+        patch("subprocess.run", side_effect=_mock_systemctl_inactive),
+    ):
+        status = check_service()
+
+    assert status["unit_exists"] is False
+    assert status["active"] is False
+    assert status["enabled"] is False
