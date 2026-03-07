@@ -324,17 +324,63 @@ def _call_claude(system_prompt: str, user_message: str) -> str:
 
     Returns the text response. Raises on non-zero exit.
     Strips CLAUDECODE from env to allow nested subprocess calls.
+
+    Uses --append-system-prompt for the system prompt (small) and -p
+    for the user message. If the user message exceeds ARG_MAX safety
+    margin, writes it to a temp file and has claude Read it.
     """
     claude_bin = _find_claude()
-    full_prompt = f"<system>{system_prompt}</system>\n\n{user_message}"
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    result = subprocess.run(
-        [claude_bin, "--print", "-p", full_prompt, "--max-turns", "1"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=env,
-    )
+
+    # ARG_MAX is typically 2MB+. Use 1MB as safe threshold for the
+    # user message (leaving room for env vars and other args).
+    if len(user_message) < 1_000_000:
+        result = subprocess.run(
+            [
+                claude_bin,
+                "--print",
+                "--append-system-prompt",
+                system_prompt,
+                "-p",
+                user_message,
+                "--max-turns",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+    else:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(user_message)
+            prompt_path = f.name
+
+        try:
+            result = subprocess.run(
+                [
+                    claude_bin,
+                    "--print",
+                    "--append-system-prompt",
+                    system_prompt,
+                    "-p",
+                    f"Read {prompt_path} and follow the instructions inside it.",
+                    "--max-turns",
+                    "2",
+                    "--allowedTools",
+                    "Read",
+                    "--dangerously-skip-permissions",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=env,
+            )
+        finally:
+            os.unlink(prompt_path)
+
     if result.returncode != 0:
         raise RuntimeError(
             f"claude --print failed (exit {result.returncode}): {result.stderr[:500]}"
