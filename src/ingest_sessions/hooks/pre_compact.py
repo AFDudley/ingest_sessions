@@ -64,7 +64,7 @@ def _api_post(port: str, path: str, payload: dict) -> dict | None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read())
     except urllib.error.URLError as e:
         print(f"ingest-sessions server error at {url}: {e}", file=sys.stderr)

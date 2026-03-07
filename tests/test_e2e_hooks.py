@@ -38,13 +38,16 @@ def _mock_claude_bin() -> str | None:
     return shutil.which("mock-claude")
 
 
-def _make_record(uuid: str, session_id: str, msg_type: str, content: str) -> dict:
+def _make_record(
+    uuid: str, session_id: str, msg_type: str, content: str, index: int = 0
+) -> dict:
     """Build a JSONL record matching Claude Code transcript format."""
+    minutes, seconds = divmod(index, 60)
     return {
         "uuid": uuid,
         "sessionId": session_id,
         "type": msg_type,
-        "timestamp": f"2026-03-01T12:00:{int(uuid.split('-')[-1]):02d}.000Z",
+        "timestamp": f"2026-03-01T12:{minutes:02d}:{seconds:02d}.000Z",
         "parentUuid": None,
         "message": {"role": msg_type, "content": content},
     }
@@ -56,7 +59,7 @@ def _write_transcript(path: Path, session_id: str, num_messages: int) -> None:
         for i in range(num_messages):
             msg_type = "user" if i % 2 == 0 else "assistant"
             content = f"Message {i}: {'What about topic X?' if msg_type == 'user' else 'Here is information about topic X with details.'}"
-            record = _make_record(f"msg-{i}", session_id, msg_type, content)
+            record = _make_record(f"msg-{i}", session_id, msg_type, content, index=i)
             f.write(json.dumps(record) + "\n")
 
 
@@ -74,6 +77,7 @@ def _wait_for_server(port: int, timeout: float = 10.0) -> None:
 
 def _api_post(port: int, path: str, payload: dict, timeout: int = 120) -> dict:
     """POST JSON to the server REST API."""
+    import urllib.error
     import urllib.request
 
     url = f"http://127.0.0.1:{port}{path}"
@@ -84,8 +88,12 @@ def _api_post(port: int, path: str, payload: dict, timeout: int = 120) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        raise AssertionError(f"{e.code} {e.reason} from {path}: {body}") from e
 
 
 @pytest.fixture
@@ -187,6 +195,10 @@ def test_precompact_creates_sprigs(server, server_env):
     )
     assert result.returncode == 0, f"Hook stderr: {result.stderr}"
 
+    # The hook fires summarization asynchronously (202). Call synchronously
+    # to wait for completion before checking context.
+    _api_post(port, "/api/summarize", {"session_id": session_id, "wait": True})
+
     # Verify sprigs were created via REST API
     resp = _api_post(port, "/api/context", {"session_id": session_id})
     assert resp["context"] is not None
@@ -204,25 +216,18 @@ def test_precompact_with_many_messages(server, server_env):
     transcript = proj_dir / f"{session_id}.jsonl"
     _write_transcript(transcript, session_id, 100)
 
-    hook_env = {**server_env, "INGEST_SESSIONS_PORT": str(port)}
-    result = _run_hook(
-        "pre_compact.py",
-        {
-            "session_id": session_id,
-            "transcript_path": str(transcript),
-            "cwd": str(proj_dir),
-            "hook_event_name": "PreCompact",
-            "trigger": "auto",
-        },
-        hook_env,
-    )
-    assert result.returncode == 0, f"Hook stderr: {result.stderr}"
+    # Refresh first (the hook does this synchronously)
+    _api_post(port, "/api/refresh", {"path": str(transcript)})
+
+    # Summarize synchronously so we can verify results
+    _api_post(port, "/api/summarize", {"session_id": session_id, "wait": True})
 
     resp = _api_post(port, "/api/context", {"session_id": session_id})
     ctx = resp["context"]
     assert ctx is not None
-    # Multiple summaries should be present
-    assert ctx.count("Summary ID:") >= 2
+    # 100 messages = 5 sprigs → condensed into a bindle
+    # Context should contain at least one condensed summary
+    assert "Condensed Summary" in ctx or "Summary ID:" in ctx
 
 
 def test_session_start_recovers_context(server, server_env):
@@ -251,6 +256,9 @@ def test_session_start_recovers_context(server, server_env):
         hook_env,
     )
     assert result.returncode == 0, f"PreCompact stderr: {result.stderr}"
+
+    # Wait for summarization to complete (hook fires it async)
+    _api_post(port, "/api/summarize", {"session_id": session_id, "wait": True})
 
     # Now simulate /clear — new session ID, same project dir
     new_session_id = "sess-recovery-002"
@@ -325,6 +333,9 @@ def test_full_cycle_ingest_summarize_recover(server, server_env):
         hook_env,
     )
     assert result.returncode == 0
+
+    # Wait for summarization to complete (hook fires it async)
+    _api_post(port, "/api/summarize", {"session_id": session_id, "wait": True})
 
     # Phase 3: Verify summaries exist
     resp = _api_post(port, "/api/context", {"session_id": session_id})

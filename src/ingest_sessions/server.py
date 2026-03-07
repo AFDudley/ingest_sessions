@@ -613,9 +613,9 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
         """REST endpoint for the PreCompact hook (step 2: run DAG maintenance).
 
         POST /api/summarize with {"session_id": "..."}.
-        Returns {"sprigs_created": N, "bindles_created": N, ...}.
+        Returns 202 immediately; summarization runs in the background.
 
-        Runs LLM calls outside the DB thread via asyncio.to_thread.
+        The hook caller does not need to wait for LLM calls to finish.
         """
         body = await request.json()
         session_id = body.get("session_id", "")
@@ -623,8 +623,28 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             return starlette.responses.JSONResponse(
                 {"error": "session_id required"}, status_code=400
             )
-        result = await _run_summarize_async(session_id)
-        return starlette.responses.JSONResponse(result)
+
+        if body.get("wait"):
+            result = await _run_summarize_async(session_id)
+            return starlette.responses.JSONResponse(result)
+
+        async def _bg_summarize() -> None:
+            try:
+                result = await _run_summarize_async(session_id)
+                print(
+                    f"[ingest-sessions] summarize {session_id}: {result}",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                print(
+                    f"[ingest-sessions] summarize {session_id} failed: {exc}",
+                    file=sys.stderr,
+                )
+
+        asyncio.ensure_future(_bg_summarize())
+        return starlette.responses.JSONResponse(
+            {"status": "accepted", "session_id": session_id}, status_code=202
+        )
 
     import starlette.requests
     import starlette.responses
