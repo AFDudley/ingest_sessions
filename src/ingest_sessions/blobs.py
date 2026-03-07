@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from pathlib import Path
+from typing import Any
+
+import duckdb
 
 # Volt uses 100KB / 25K tokens. We match the byte threshold.
 BLOB_THRESHOLD_BYTES = 100_000
@@ -66,3 +70,41 @@ def read_blob(file_id: str, blob_root: Path | None = None) -> str | None:
     if not path.exists():
         return None
     return path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# DuckDB metadata
+# ---------------------------------------------------------------------------
+
+
+def insert_blob_meta(
+    db: duckdb.DuckDBPyConnection,
+    file_id: str,
+    session_id: str,
+    token_count: int,
+    original_size: int,
+) -> None:
+    """Record blob metadata in DuckDB. Idempotent."""
+    ts = int(time.time() * 1000)
+    db.execute(
+        "INSERT OR IGNORE INTO blob_meta VALUES (?, ?, ?, ?, ?)",
+        [file_id, session_id, token_count, original_size, ts],
+    )
+
+
+def get_blob_meta(db: duckdb.DuckDBPyConnection, file_id: str) -> dict[str, Any] | None:
+    """Get blob metadata by file_id. Returns None if not found."""
+    row = db.execute(
+        "SELECT file_id, session_id, token_count, original_size, created_at "
+        "FROM blob_meta WHERE file_id = ?",
+        [file_id],
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "file_id": row[0],
+        "session_id": row[1],
+        "token_count": row[2],
+        "original_size": row[3],
+        "created_at": row[4],
+    }
