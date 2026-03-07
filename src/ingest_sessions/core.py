@@ -225,16 +225,93 @@ def ingest_session_metadata(
 # ---------------------------------------------------------------------------
 
 
+def _make_blob_marker(file_id: str, token_count: int) -> str:
+    """Build the compact marker that replaces large content."""
+    return f"[Large Content: {file_id}] [Tokens: ~{token_count}]"
+
+
+def _extract_blobs(
+    db: duckdb.DuckDBPyConnection,
+    record: dict,
+    session_id: str,
+    blob_root: Path,
+) -> None:
+    """Extract large content blocks from a record, mutating it in place.
+
+    Writes blobs to disk, records metadata in DuckDB, and replaces
+    content with compact markers.
+    """
+    from ingest_sessions.blobs import (
+        insert_blob_meta,
+        is_large_content,
+        write_blob,
+    )
+
+    msg = record.get("message")
+    if not isinstance(msg, dict):
+        return
+    content = msg.get("content")
+    if content is None:
+        return
+
+    # Case 1: content is a plain string
+    if isinstance(content, str) and is_large_content(content):
+        file_id = write_blob(content, blob_root=blob_root)
+        token_count = len(content) // 4
+        insert_blob_meta(db, file_id, session_id, token_count, len(content))
+        msg["content"] = _make_blob_marker(file_id, token_count)
+        return
+
+    # Case 2: content is a list of blocks
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text", "")
+            if is_large_content(text):
+                file_id = write_blob(text, blob_root=blob_root)
+                token_count = len(text) // 4
+                insert_blob_meta(db, file_id, session_id, token_count, len(text))
+                block["text"] = _make_blob_marker(file_id, token_count)
+        elif block.get("type") == "tool_result":
+            result_content = block.get("content", "")
+            if isinstance(result_content, str) and is_large_content(result_content):
+                file_id = write_blob(result_content, blob_root=blob_root)
+                token_count = len(result_content) // 4
+                insert_blob_meta(
+                    db, file_id, session_id, token_count, len(result_content)
+                )
+                block["content"] = _make_blob_marker(file_id, token_count)
+            elif isinstance(result_content, list):
+                for sub in result_content:
+                    if isinstance(sub, dict) and sub.get("type") == "text":
+                        text = sub.get("text", "")
+                        if is_large_content(text):
+                            file_id = write_blob(text, blob_root=blob_root)
+                            token_count = len(text) // 4
+                            insert_blob_meta(
+                                db, file_id, session_id, token_count, len(text)
+                            )
+                            sub["text"] = _make_blob_marker(file_id, token_count)
+
+
 def ingest_jsonl(
     db: duckdb.DuckDBPyConnection,
     jsonl_path: Path,
     byte_offset: int = 0,
+    blob_root: Path | None = None,
 ) -> int:
     """Ingest a single JSONL session file.  Returns record count.
 
     When byte_offset > 0, only lines after that offset are read (JSONL is
     append-only).  The first partial line after the offset is silently
     skipped to avoid parsing a truncated JSON object.
+
+    When blob_root is provided, large content blocks are extracted to the
+    blob store and replaced with compact markers before insertion into
+    DuckDB.  See blobs.py for threshold and storage details.
     """
     with open(jsonl_path, "r") as f:
         if byte_offset > 0:
@@ -251,6 +328,12 @@ def ingest_jsonl(
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
+
+        # Extract large content blocks to blob store
+        if blob_root is not None:
+            _extract_blobs(db, record, session_id, blob_root)
+            line = json.dumps(record)
+
         batch.append(
             (
                 record.get("uuid", ""),
