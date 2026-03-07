@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 from typing import Any
 
@@ -302,17 +304,36 @@ def build_deterministic_fallback(
 # ---------------------------------------------------------------------------
 
 
+def _find_claude() -> str:
+    """Resolve the ``claude`` binary path.
+
+    Falls back to ``~/.local/bin/claude`` when PATH is minimal
+    (e.g. systemd-managed server processes).
+    """
+    found = shutil.which("claude")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/claude")
+    if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
+        return fallback
+    raise FileNotFoundError("claude binary not found on PATH or at ~/.local/bin/claude")
+
+
 def _call_claude(system_prompt: str, user_message: str) -> str:
     """Call claude --print with a system prompt and user message.
 
     Returns the text response. Raises on non-zero exit.
+    Strips CLAUDECODE from env to allow nested subprocess calls.
     """
+    claude_bin = _find_claude()
     full_prompt = f"<system>{system_prompt}</system>\n\n{user_message}"
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     result = subprocess.run(
-        ["claude", "--print", "-p", full_prompt, "--max-turns", "1"],
+        [claude_bin, "--print", "-p", full_prompt, "--max-turns", "1"],
         capture_output=True,
         text=True,
         timeout=120,
+        env=env,
     )
     if result.returncode != 0:
         raise RuntimeError(
