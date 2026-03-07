@@ -488,6 +488,25 @@ async def test_summaries_table_exists(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_server_lists_summarize_tool(tmp_path: Path):
+    """The server should list 'summarize' and 'context' as tools."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.list_tools()
+        tool_names = [t.name for t in result.tools]
+        assert "summarize" in tool_names
+        assert "context" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_context_tool_returns_none_without_summaries(tmp_path: Path):
+    """Context tool should indicate no summaries when DAG is empty."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.call_tool("context", {"session_id": "nonexistent"})
+        body = json.loads(_text(result))
+        assert body.get("context") is None
+
+
+@pytest.mark.asyncio
 async def test_http_query_and_refresh(tmp_path: Path):
     """Exercise query and refresh tools over the HTTP transport."""
     proj_dir = tmp_path / "projects" / "myproject"

@@ -35,6 +35,10 @@ from watchdog.events import (
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
+from ingest_sessions.dag import (
+    assemble_context_for_session,
+    run_summarize_session,
+)
 from ingest_sessions.core import (
     build_session_metadata,
     create_tables,
@@ -295,6 +299,43 @@ async def list_tools() -> list[Tool]:
                 "required": ["path"],
             },
         ),
+        Tool(
+            name="summarize",
+            description=(
+                "Trigger LCM summary DAG maintenance for a session. "
+                "Summarizes unsummarized messages into sprigs, "
+                "condenses sprigs into bindles. Uses claude --print "
+                "(covered by Max). Returns counts of nodes created."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The session ID to summarize.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="context",
+            description=(
+                "Assemble recovery context from the LCM summary DAG "
+                "for a session. Returns the formatted context string "
+                "suitable for injection after /clear."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The session ID to get context for.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        ),
     ]
 
 
@@ -326,6 +367,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         try:
             count = await _db_execute(lambda db: _ingest_file_full(db, jsonl_path))
             return [TextContent(type="text", text=json.dumps({"processed": count}))]
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+    if name == "summarize":
+        session_id = arguments["session_id"]
+        try:
+            result_data = await _db_execute(
+                lambda db: run_summarize_session(db, session_id)
+            )
+            return [TextContent(type="text", text=json.dumps(result_data))]
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+    if name == "context":
+        session_id = arguments["session_id"]
+        try:
+            ctx = await _db_execute(
+                lambda db: assemble_context_for_session(db, session_id)
+            )
+            return [TextContent(type="text", text=json.dumps({"context": ctx}))]
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
