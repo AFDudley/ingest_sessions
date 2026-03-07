@@ -4,6 +4,10 @@ Coordinates the creation and condensation of summary nodes:
 - Chunks unsummarized messages into sprigs (d1)
 - Condenses accumulated sprigs into bindles (d2)
 
+The public API is split into DB-only functions (safe for the DB thread)
+and orchestration functions that call the LLM (must NOT run in the DB
+thread).  The server is responsible for calling them in the right context.
+
 # See docs/plans/2026-03-07-lcm-summary-dag.md
 """
 
@@ -17,7 +21,6 @@ import duckdb
 from ingest_sessions.summarize import (
     condense_summaries,
     estimate_tokens,
-    extract_file_ids,
     generate_summary_id,
     summarize_messages,
 )
@@ -27,6 +30,11 @@ SPRIG_CHUNK_SIZE = 20
 
 # How many uncondensed sprigs before creating a bindle
 BINDLE_THRESHOLD = 4
+
+
+# ---------------------------------------------------------------------------
+# DB-only operations (safe for the DB thread)
+# ---------------------------------------------------------------------------
 
 
 def get_unsummarized_messages(
@@ -59,7 +67,6 @@ def insert_sprig(
     session_id: str,
     content: str,
     message_uuids: list[str],
-    file_ids: list[str],
 ) -> str:
     """Insert a sprig (d1) summary. Returns the summary_id."""
     ts = int(time.time() * 1000)
@@ -76,7 +83,7 @@ def insert_sprig(
             token_count,
             [],  # parent_ids (sprigs have none)
             message_uuids,
-            file_ids,
+            [],  # file_ids (unused — Volt-specific)
             ts,
         ],
     )
@@ -88,7 +95,6 @@ def insert_bindle(
     session_id: str,
     content: str,
     parent_ids: list[str],
-    file_ids: list[str],
 ) -> str:
     """Insert a bindle (d2) summary. Returns the summary_id."""
     ts = int(time.time() * 1000)
@@ -105,7 +111,7 @@ def insert_bindle(
             token_count,
             parent_ids,
             [],  # message_uuids (bindles link via parent sprigs)
-            file_ids,
+            [],  # file_ids (unused — Volt-specific)
             ts,
         ],
     )
@@ -189,6 +195,69 @@ def get_latest_summary_for_session(
     }
 
 
+def get_latest_summarized_session(
+    db: duckdb.DuckDBPyConnection,
+    project_dir: str,
+) -> str | None:
+    """Find the most recent session with summaries in a project directory.
+
+    After /clear, Claude creates a new session ID. We need the previous
+    session's context. This finds it by matching the project_path prefix
+    from the sessions table against sessions that have summaries.
+
+    Returns the session_id, or None if no summarized sessions exist.
+    """
+    row = db.execute(
+        """
+        SELECT s.session_id
+        FROM sessions s
+        INNER JOIN summaries sm ON s.session_id = sm.session_id
+        WHERE s.project_path LIKE ? || '%'
+           OR s.session_id IN (
+               SELECT DISTINCT r.session_id FROM records r
+               WHERE r.uuid IN (
+                   SELECT f.file_path FROM file_mtimes f
+                   WHERE f.file_path LIKE ? || '%'
+               )
+           )
+        ORDER BY sm.created_at DESC
+        LIMIT 1
+        """,
+        [project_dir, project_dir],
+    ).fetchone()
+    if row is None:
+        # Fallback: find any session whose JSONL file is in this directory
+        # by matching session_id against filenames in the dir
+        row = db.execute(
+            """
+            SELECT s.session_id
+            FROM summaries s
+            INNER JOIN file_mtimes f ON f.file_path LIKE '%/' || s.session_id || '.jsonl'
+            WHERE f.file_path LIKE ? || '%'
+            ORDER BY s.created_at DESC
+            LIMIT 1
+            """,
+            [project_dir],
+        ).fetchone()
+    return row[0] if row else None
+
+
+def get_latest_bindle_content(
+    db: duckdb.DuckDBPyConnection,
+    session_id: str,
+) -> str | None:
+    """Get the content of the most recent bindle, or None."""
+    row = db.execute(
+        """
+        SELECT content FROM summaries
+        WHERE session_id = ? AND kind = 'bindle'
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        [session_id],
+    ).fetchone()
+    return row[0] if row else None
+
+
 def assemble_context_for_session(
     db: duckdb.DuckDBPyConnection,
     session_id: str,
@@ -198,9 +267,10 @@ def assemble_context_for_session(
     Returns a formatted string combining:
     1. The highest-order summary (bindle if available)
     2. Any uncondensed sprigs (more recent than the bindle)
-    3. Pointers to the query tool for deeper retrieval
+    3. Unsummarized tail messages (not yet chunked into sprigs)
+    4. Pointers to the query tool for deeper retrieval
 
-    Returns None if no summaries exist for the session.
+    Returns None if no summaries and no messages exist for the session.
     """
     # Get all bindles (ordered by recency)
     bindles = db.execute(
@@ -216,7 +286,10 @@ def assemble_context_for_session(
     # Get uncondensed sprigs
     uncondensed = get_sprigs_for_session(db, session_id, uncondensed_only=True)
 
-    if not bindles and not uncondensed:
+    # Get unsummarized tail messages
+    tail_messages = get_unsummarized_messages(db, session_id)
+
+    if not bindles and not uncondensed and not tail_messages:
         return None
 
     parts: list[str] = []
@@ -231,11 +304,10 @@ def assemble_context_for_session(
     if bindles:
         parts.append("## Condensed Session History")
         parts.append("")
-        # Most recent bindle first (usually just one)
-        for b in bindles[:1]:
-            parts.append(f"[Summary ID: {b[0]}]")
-            parts.append(b[1])
-            parts.append("")
+        # Most recent bindle (usually just one)
+        parts.append(f"[Summary ID: {bindles[0][0]}]")
+        parts.append(bindles[0][1])
+        parts.append("")
 
     if uncondensed:
         parts.append("## Recent Activity (not yet condensed)")
@@ -245,7 +317,37 @@ def assemble_context_for_session(
             parts.append(s["content"])
             parts.append("")
 
+    if tail_messages:
+        parts.append("## Unsummarized Tail (most recent messages)")
+        parts.append("")
+        for msg in tail_messages:
+            role = msg.get("type", "unknown")
+            uuid = msg.get("uuid", "?")
+            parts.append(f"[{role} {uuid}]")
+            try:
+                record = __import__("json").loads(msg.get("raw", "{}"))
+                content = record.get("message", {}).get("content", "")
+                if isinstance(content, str):
+                    if len(content) > 500:
+                        content = content[:500] + "..."
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if len(text) > 500:
+                                text = text[:500] + "..."
+                            parts.append(text)
+            except Exception:
+                parts.append("[could not extract content]")
+            parts.append("")
+
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Orchestration (calls LLM — must NOT run in the DB thread)
+# ---------------------------------------------------------------------------
 
 
 def run_summarize_session(
@@ -256,6 +358,11 @@ def run_summarize_session(
 
     1. Chunk unsummarized messages into sprigs (SPRIG_CHUNK_SIZE each)
     2. If enough uncondensed sprigs exist, condense into a bindle
+
+    This function calls the LLM and therefore MUST NOT run inside the
+    DB thread.  The server must run it via asyncio.to_thread or similar.
+
+    Raises SummarizationError if the LLM fails to compress.
 
     Returns counts of what was created.
     """
@@ -272,34 +379,20 @@ def run_summarize_session(
     for i in range(full_chunks):
         chunk = unsummarized[i * SPRIG_CHUNK_SIZE : (i + 1) * SPRIG_CHUNK_SIZE]
         content = summarize_messages(chunk, previous_summary_context=previous_context)
-        file_ids = extract_file_ids("\n".join(r.get("raw", "") for r in chunk))
         uuids = [r["uuid"] for r in chunk]
-        insert_sprig(db, session_id, content, uuids, file_ids)
+        insert_sprig(db, session_id, content, uuids)
         previous_context = content
         sprigs_created += 1
 
     # Condense uncondensed sprigs into a bindle if threshold met
     uncondensed = get_sprigs_for_session(db, session_id, uncondensed_only=True)
     if len(uncondensed) >= BINDLE_THRESHOLD:
-        # Get the most recent bindle for narrative continuity
-        latest_bindle = db.execute(
-            """
-            SELECT content FROM summaries
-            WHERE session_id = ? AND kind = 'bindle'
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            [session_id],
-        ).fetchone()
-        bindle_context = latest_bindle[0] if latest_bindle else None
-
+        bindle_context = get_latest_bindle_content(db, session_id)
         content = condense_summaries(
             uncondensed, previous_summary_context=bindle_context
         )
         parent_ids = [s["summary_id"] for s in uncondensed]
-        all_file_ids: list[str] = []
-        for s in uncondensed:
-            all_file_ids.extend(extract_file_ids(s["content"]))
-        insert_bindle(db, session_id, content, parent_ids, sorted(set(all_file_ids)))
+        insert_bindle(db, session_id, content, parent_ids)
         bindles_created += 1
 
     return {

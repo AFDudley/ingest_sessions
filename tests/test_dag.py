@@ -14,6 +14,7 @@ import pytest
 from ingest_sessions.core import create_tables
 from ingest_sessions.dag import (
     SPRIG_CHUNK_SIZE,
+    assemble_context_for_session,
     get_latest_summary_for_session,
     get_sprigs_for_session,
     get_unsummarized_messages,
@@ -71,7 +72,7 @@ def test_get_unsummarized_messages_all_new(db: duckdb.DuckDBPyConnection):
 def test_get_unsummarized_messages_some_covered(db: duckdb.DuckDBPyConnection):
     """Messages covered by a sprig are excluded."""
     uuids = _seed_records(db, "sess-1", 10)
-    insert_sprig(db, "sess-1", "test summary", uuids[:5], [])
+    insert_sprig(db, "sess-1", "test summary", uuids[:5])
     result = get_unsummarized_messages(db, "sess-1")
     assert len(result) == 5
     result_uuids = [r["uuid"] for r in result]
@@ -82,7 +83,7 @@ def test_get_unsummarized_messages_some_covered(db: duckdb.DuckDBPyConnection):
 def test_insert_sprig(db: duckdb.DuckDBPyConnection):
     """insert_sprig creates a sprig row with correct fields."""
     uuids = _seed_records(db, "sess-1", 5)
-    sid = insert_sprig(db, "sess-1", "summary content", uuids, ["file_abc"])
+    sid = insert_sprig(db, "sess-1", "summary content", uuids)
     assert sid.startswith("sum_")
     row = db.execute("SELECT * FROM summaries WHERE summary_id = ?", [sid]).fetchone()
     assert row is not None
@@ -93,9 +94,9 @@ def test_insert_sprig(db: duckdb.DuckDBPyConnection):
 def test_insert_bindle(db: duckdb.DuckDBPyConnection):
     """insert_bindle creates a bindle row referencing parent sprigs."""
     uuids = _seed_records(db, "sess-1", 10)
-    s1 = insert_sprig(db, "sess-1", "summary 1", uuids[:5], [])
-    s2 = insert_sprig(db, "sess-1", "summary 2", uuids[5:], [])
-    bid = insert_bindle(db, "sess-1", "condensed content", [s1, s2], [])
+    s1 = insert_sprig(db, "sess-1", "summary 1", uuids[:5])
+    s2 = insert_sprig(db, "sess-1", "summary 2", uuids[5:])
+    bid = insert_bindle(db, "sess-1", "condensed content", [s1, s2])
     assert bid.startswith("sum_")
     row = db.execute("SELECT * FROM summaries WHERE summary_id = ?", [bid]).fetchone()
     assert row is not None
@@ -106,11 +107,11 @@ def test_insert_bindle(db: duckdb.DuckDBPyConnection):
 def test_get_sprigs_for_session(db: duckdb.DuckDBPyConnection):
     """get_sprigs_for_session returns sprigs not yet condensed into bindles."""
     uuids = _seed_records(db, "sess-1", 15)
-    s1 = insert_sprig(db, "sess-1", "summary 1", uuids[:5], [])
-    s2 = insert_sprig(db, "sess-1", "summary 2", uuids[5:10], [])
-    s3 = insert_sprig(db, "sess-1", "summary 3", uuids[10:], [])
+    s1 = insert_sprig(db, "sess-1", "summary 1", uuids[:5])
+    s2 = insert_sprig(db, "sess-1", "summary 2", uuids[5:10])
+    s3 = insert_sprig(db, "sess-1", "summary 3", uuids[10:])
     # Condense s1 and s2 into a bindle
-    insert_bindle(db, "sess-1", "condensed", [s1, s2], [])
+    insert_bindle(db, "sess-1", "condensed", [s1, s2])
     # Only s3 should be uncondensed
     uncondensed = get_sprigs_for_session(db, "sess-1", uncondensed_only=True)
     assert len(uncondensed) == 1
@@ -120,9 +121,9 @@ def test_get_sprigs_for_session(db: duckdb.DuckDBPyConnection):
 def test_get_latest_summary_for_session(db: duckdb.DuckDBPyConnection):
     """Returns the highest-order summary (bindle > sprig) for context assembly."""
     uuids = _seed_records(db, "sess-1", 10)
-    s1 = insert_sprig(db, "sess-1", "sprig 1", uuids[:5], [])
-    s2 = insert_sprig(db, "sess-1", "sprig 2", uuids[5:], [])
-    insert_bindle(db, "sess-1", "the bindle", [s1, s2], [])
+    s1 = insert_sprig(db, "sess-1", "sprig 1", uuids[:5])
+    s2 = insert_sprig(db, "sess-1", "sprig 2", uuids[5:])
+    insert_bindle(db, "sess-1", "the bindle", [s1, s2])
     latest = get_latest_summary_for_session(db, "sess-1")
     assert latest is not None
     assert latest["kind"] == "bindle"
@@ -137,3 +138,18 @@ def test_run_summarize_session_creates_sprigs(db: duckdb.DuckDBPyConnection):
     assert result["sprigs_created"] == 2  # 2 full chunks, remainder < chunk size
     sprigs = get_sprigs_for_session(db, "sess-1")
     assert len(sprigs) == 2
+
+
+def test_assemble_context_includes_tail(db: duckdb.DuckDBPyConnection):
+    """assemble_context_for_session includes unsummarized tail messages."""
+    _seed_records(db, "sess-1", 5)
+    ctx = assemble_context_for_session(db, "sess-1")
+    assert ctx is not None
+    assert "Unsummarized Tail" in ctx
+    assert "Message 0 content here" in ctx
+
+
+def test_assemble_context_empty_session(db: duckdb.DuckDBPyConnection):
+    """assemble_context_for_session returns None for empty sessions."""
+    ctx = assemble_context_for_session(db, "nonexistent")
+    assert ctx is None

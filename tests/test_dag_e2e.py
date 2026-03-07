@@ -1,9 +1,6 @@
 """E2E test for the DAG round-trip.
 
 Seeds messages, runs summarize (with mock LLM), verifies context assembly.
-Uses direct DB access for the summarization step (since the server runs
-in a subprocess where mocks can't be applied), then verifies context
-retrieval through the MCP server.
 """
 
 import json
@@ -11,11 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import duckdb
-import pytest
 
 from ingest_sessions.core import create_tables, ingest_jsonl
 from ingest_sessions.dag import assemble_context_for_session, run_summarize_session
-from tests.test_server import _text, run_server
 
 
 def _make_records(session_id: str, count: int) -> list[dict]:
@@ -32,8 +27,11 @@ def _make_records(session_id: str, count: int) -> list[dict]:
                 "parentUuid": None,
                 "message": {
                     "role": role,
-                    "content": f"{'User asks about' if role == 'user' else 'Assistant explains'} topic {i}. "
-                    f"This involves file src/module_{i}.py and function process_{i}().",
+                    "content": (
+                        f"{'User asks about' if role == 'user' else 'Assistant explains'}"
+                        f" topic {i}. This involves file src/module_{i}.py"
+                        f" and function process_{i}()."
+                    ),
                 },
             }
         )
@@ -84,13 +82,8 @@ def test_full_dag_roundtrip(tmp_path: Path):
     assert ctx is not None
     assert "continued after a /clear" in ctx
     assert "Summary ID:" in ctx
+
+    # Verify unsummarized tail is included
+    assert "Unsummarized Tail" in ctx
+
     db.close()
-
-
-@pytest.mark.asyncio
-async def test_context_empty_session(tmp_path: Path):
-    """Context for a session with no summaries returns None."""
-    async with run_server(tmp_path) as (client, _):
-        result = await client.call_tool("context", {"session_id": "nonexistent"})
-        body = json.loads(_text(result))
-        assert body["context"] is None

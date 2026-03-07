@@ -19,6 +19,7 @@ import queue
 import sys
 import threading
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -36,8 +37,19 @@ from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
 from ingest_sessions.dag import (
+    BINDLE_THRESHOLD,
+    SPRIG_CHUNK_SIZE,
     assemble_context_for_session,
-    run_summarize_session,
+    get_latest_bindle_content,
+    get_latest_summarized_session,
+    get_sprigs_for_session,
+    get_unsummarized_messages,
+    insert_bindle,
+    insert_sprig,
+)
+from ingest_sessions.summarize import (
+    condense_summaries,
+    summarize_messages,
 )
 from ingest_sessions.core import (
     build_session_metadata,
@@ -161,6 +173,73 @@ def _ingest_all(db: duckdb.DuckDBPyConnection) -> None:
         if changed:
             ingest_history(db, history)
             record_file(db, history)
+
+
+# ---------------------------------------------------------------------------
+# Async summarization (shared by MCP tool handler and REST endpoint)
+# ---------------------------------------------------------------------------
+
+
+async def _run_summarize_async(session_id: str) -> dict[str, int]:
+    """Run one pass of DAG maintenance for a session.
+
+    DB reads/writes go through _db_execute (DB thread).
+    LLM calls go through asyncio.to_thread (NOT the DB thread).
+
+    Returns counts of what was created.
+    """
+    unsummarized = await _db_execute(
+        partial(get_unsummarized_messages, session_id=session_id)
+    )
+    existing_sprigs = await _db_execute(
+        partial(get_sprigs_for_session, session_id=session_id)
+    )
+    previous_context = existing_sprigs[-1]["content"] if existing_sprigs else None
+
+    sprigs_created = 0
+    full_chunks = len(unsummarized) // SPRIG_CHUNK_SIZE
+    for i in range(full_chunks):
+        chunk = unsummarized[i * SPRIG_CHUNK_SIZE : (i + 1) * SPRIG_CHUNK_SIZE]
+        content = await asyncio.to_thread(summarize_messages, chunk, previous_context)
+        uuids = [r["uuid"] for r in chunk]
+        await _db_execute(
+            partial(
+                insert_sprig,
+                session_id=session_id,
+                content=content,
+                message_uuids=uuids,
+            )
+        )
+        previous_context = content
+        sprigs_created += 1
+
+    uncondensed = await _db_execute(
+        partial(get_sprigs_for_session, session_id=session_id, uncondensed_only=True)
+    )
+    bindles_created = 0
+    if len(uncondensed) >= BINDLE_THRESHOLD:
+        bindle_context = await _db_execute(
+            partial(get_latest_bindle_content, session_id=session_id)
+        )
+        content = await asyncio.to_thread(
+            condense_summaries, uncondensed, bindle_context
+        )
+        parent_ids = [s["summary_id"] for s in uncondensed]
+        await _db_execute(
+            partial(
+                insert_bindle,
+                session_id=session_id,
+                content=content,
+                parent_ids=parent_ids,
+            )
+        )
+        bindles_created += 1
+
+    return {
+        "sprigs_created": sprigs_created,
+        "bindles_created": bindles_created,
+        "unsummarized_remaining": len(unsummarized) - (full_chunks * SPRIG_CHUNK_SIZE),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -372,19 +451,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     if name == "summarize":
         session_id = arguments["session_id"]
-        try:
-            result_data = await _db_execute(
-                lambda db: run_summarize_session(db, session_id)
-            )
-            return [TextContent(type="text", text=json.dumps(result_data))]
-        except Exception as e:
-            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        result_data = await _run_summarize_async(session_id)
+        return [TextContent(type="text", text=json.dumps(result_data))]
 
     if name == "context":
         session_id = arguments["session_id"]
         try:
             ctx = await _db_execute(
-                lambda db: assemble_context_for_session(db, session_id)
+                partial(assemble_context_for_session, session_id=session_id)
             )
             return [TextContent(type="text", text=json.dumps({"context": ctx}))]
         except Exception as e:
@@ -489,8 +563,80 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             finally:
                 _shutdown(observer)
 
+    async def handle_context_api(
+        request: starlette.requests.Request,
+    ) -> starlette.responses.JSONResponse:
+        """REST endpoint for the SessionStart hook.
+
+        POST /api/context with {"project_dir": "..."} or {"session_id": "..."}.
+        Returns {"context": "..."} or {"context": null}.
+        Bypasses MCP protocol — the hook is a plain HTTP client.
+        """
+        body = await request.json()
+        session_id = body.get("session_id")
+
+        if not session_id:
+            project_dir = body.get("project_dir", "")
+            if project_dir:
+                session_id = await _db_execute(
+                    partial(get_latest_summarized_session, project_dir=project_dir)
+                )
+
+        if not session_id:
+            return starlette.responses.JSONResponse({"context": None})
+
+        ctx = await _db_execute(
+            partial(assemble_context_for_session, session_id=session_id)
+        )
+        return starlette.responses.JSONResponse({"context": ctx})
+
+    async def handle_refresh_api(
+        request: starlette.requests.Request,
+    ) -> starlette.responses.JSONResponse:
+        """REST endpoint for the PreCompact hook (step 1: ingest new messages).
+
+        POST /api/refresh with {"path": "/path/to/session.jsonl"}.
+        Returns {"processed": N} or {"error": "..."}.
+        """
+        body = await request.json()
+        jsonl_path = Path(body.get("path", ""))
+        if not jsonl_path.exists():
+            return starlette.responses.JSONResponse(
+                {"error": f"File not found: {jsonl_path}"}, status_code=404
+            )
+        count = await _db_execute(lambda db: _ingest_file_full(db, jsonl_path))
+        return starlette.responses.JSONResponse({"processed": count})
+
+    async def handle_summarize_api(
+        request: starlette.requests.Request,
+    ) -> starlette.responses.JSONResponse:
+        """REST endpoint for the PreCompact hook (step 2: run DAG maintenance).
+
+        POST /api/summarize with {"session_id": "..."}.
+        Returns {"sprigs_created": N, "bindles_created": N, ...}.
+
+        Runs LLM calls outside the DB thread via asyncio.to_thread.
+        """
+        body = await request.json()
+        session_id = body.get("session_id", "")
+        if not session_id:
+            return starlette.responses.JSONResponse(
+                {"error": "session_id required"}, status_code=400
+            )
+        result = await _run_summarize_async(session_id)
+        return starlette.responses.JSONResponse(result)
+
+    import starlette.requests
+    import starlette.responses
+    from starlette.routing import Route
+
     app = Starlette(
-        routes=[Mount("/mcp", app=handle_mcp)],
+        routes=[
+            Mount("/mcp", app=handle_mcp),
+            Route("/api/context", handle_context_api, methods=["POST"]),
+            Route("/api/refresh", handle_refresh_api, methods=["POST"]),
+            Route("/api/summarize", handle_summarize_api, methods=["POST"]),
+        ],
         lifespan=lifespan,
     )
 

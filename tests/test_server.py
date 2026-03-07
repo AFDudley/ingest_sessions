@@ -541,3 +541,51 @@ async def test_http_query_and_refresh(tmp_path: Path):
             "query", {"sql": "SELECT count(*) AS n FROM records"}
         )
         assert json.loads(_text(result)) == [{"n": 2}]
+
+
+@pytest.mark.asyncio
+async def test_rest_context_endpoint(tmp_path: Path):
+    """The /api/context REST endpoint returns context for hook consumption."""
+    import urllib.request
+
+    port = _free_port()
+    db_path = str(tmp_path / "test.duckdb")
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir(exist_ok=True)
+    env = {
+        **os.environ,
+        "INGEST_SESSIONS_DB": db_path,
+        "INGEST_SESSIONS_PROJECTS_DIR": str(projects_dir),
+        "INGEST_SESSIONS_HISTORY_FILE": str(tmp_path / "history.jsonl"),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, SERVER_SCRIPT, "--port", str(port)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    # Wait for server to start
+    for _ in range(40):
+        await asyncio.sleep(0.25)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                break
+        except OSError:
+            continue
+    else:
+        proc.kill()
+        raise RuntimeError("HTTP server did not start")
+    try:
+        url = f"http://127.0.0.1:{port}/api/context"
+
+        # No summaries — should return null context
+        payload = json.dumps({"session_id": "nonexistent"}).encode()
+        req = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req) as resp:
+            body = json.loads(resp.read())
+        assert body["context"] is None
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)

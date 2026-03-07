@@ -20,6 +20,7 @@ test = [
 [project.scripts]
 ingest-sessions = "ingest_sessions.cli:main"
 ingest-sessions-server = "ingest_sessions.server:cli"
+ingest-sessions-install = "ingest_sessions.install:cli"
 
 [build-system]
 requires = ["hatchling"]

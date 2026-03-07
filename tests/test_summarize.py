@@ -1,17 +1,17 @@
 """Tests for the summarize module.
 
 These test the pure functions (formatting, ID generation, escalation)
-without LLM calls. LLM-dependent tests are in test_summarize_e2e.py.
+without LLM calls. LLM-dependent tests use mocks.
 """
 
 import json
 
 from ingest_sessions.summarize import (
+    _should_accept_output,
     build_deterministic_fallback,
     estimate_tokens,
     format_messages_for_summary,
     generate_summary_id,
-    should_accept_output,
 )
 
 
@@ -63,21 +63,28 @@ def test_format_messages_for_summary():
     assert "hi there" in result
 
 
+def test_format_messages_malformed_json():
+    """Malformed JSON records produce [malformed record] placeholder."""
+    records = [{"uuid": "bad", "type": "user", "raw": "not json{{{"}]
+    result = format_messages_for_summary(records)
+    assert "[malformed record]" in result
+
+
 def test_should_accept_output_shorter():
     """Accept output that is shorter than input."""
-    assert should_accept_output("short summary", 100) is True
+    assert _should_accept_output("short summary", 100) is True
 
 
 def test_should_accept_output_longer():
     """Reject output that is longer than input."""
     long_text = "word " * 500
-    assert should_accept_output(long_text, 10) is False
+    assert _should_accept_output(long_text, 10) is False
 
 
 def test_should_accept_output_empty():
     """Reject empty output."""
-    assert should_accept_output("", 100) is False
-    assert should_accept_output("   ", 100) is False
+    assert _should_accept_output("", 100) is False
+    assert _should_accept_output("   ", 100) is False
 
 
 def test_build_deterministic_fallback():

@@ -7,17 +7,23 @@ Summary hierarchy:
 - sprig (d1): summarizes a block of raw messages
 - bindle (d2): condenses multiple sprigs into a higher-level summary
 
-Three-level escalation guarantees convergence:
+Three-level escalation guarantees convergence (from Volt's
+compaction-escalation.ts):
 1. Normal summarization
 2. Aggressive (shorter target, bullet-point style)
-3. Deterministic truncation (no LLM, always converges)
+3. Deterministic truncation (no LLM, binary search for longest
+   prefix under token budget — always terminates)
+
+This is an algorithmic convergence guarantee, not error-handling.
+Without it, a verbose LLM response deadlocks the context window.
+
+# See docs/plans/2026-03-07-lcm-summary-dag.md
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 import subprocess
 from typing import Any
 
@@ -139,11 +145,12 @@ def generate_summary_id(content: str, timestamp: int) -> str:
 
 
 def _extract_content_text(raw_json: str) -> str:
-    """Extract readable text content from a raw JSONL record."""
-    try:
-        record = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return ""
+    """Extract readable text content from a raw JSONL record.
+
+    Raises json.JSONDecodeError on malformed input — callers at system
+    boundaries must handle this.
+    """
+    record = json.loads(raw_json)
     msg = record.get("message", {})
     if not isinstance(msg, dict):
         return ""
@@ -186,13 +193,17 @@ def format_messages_for_summary(records: list[dict[str, Any]]) -> str:
     """Format DuckDB record rows into text for the summarization prompt.
 
     Each record dict should have keys: uuid, type, raw.
+    Skips records with malformed JSON (log-worthy but not fatal at this layer).
     """
     parts: list[str] = []
     for rec in records:
         uuid = rec.get("uuid", "?")
         role = rec.get("type", "unknown")
         parts.append(f"[Message {uuid}] ({role})")
-        text = _extract_content_text(rec.get("raw", "{}"))
+        try:
+            text = _extract_content_text(rec.get("raw", "{}"))
+        except json.JSONDecodeError:
+            text = "[malformed record]"
         if text:
             parts.append(text)
         parts.append("")  # blank line between messages
@@ -201,10 +212,14 @@ def format_messages_for_summary(records: list[dict[str, Any]]) -> str:
 
 # ---------------------------------------------------------------------------
 # Three-level escalation (from Volt compaction-escalation.ts)
+#
+# This is a convergence guarantee, not error handling. Each level uses
+# a distinct strategy; level 3 is deterministic and always terminates.
+# Without this, a verbose LLM response would deadlock the context window.
 # ---------------------------------------------------------------------------
 
 
-def should_accept_output(output: str, input_tokens: int) -> bool:
+def _should_accept_output(output: str, input_tokens: int) -> bool:
     """Accept if non-empty and strictly fewer tokens than input."""
     trimmed = output.strip()
     if not trimmed:
@@ -218,7 +233,11 @@ def build_deterministic_fallback(
     source_text: str,
     input_tokens: int,
 ) -> str:
-    """Level 3 fallback: binary-search for longest prefix under token budget."""
+    """Level 3: binary-search for longest prefix under token budget.
+
+    Pure algorithm, no LLM. Guaranteed to produce output shorter than
+    input_tokens (convergence guarantee for the summary DAG).
+    """
     source = source_text.strip()
     if not source:
         return ""
@@ -238,7 +257,7 @@ def build_deterministic_fallback(
     if best:
         return best
 
-    # Try without suffix
+    # Edge case: suffix alone exceeds budget. Truncate without suffix.
     lo, hi, best = 1, len(source), ""
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -254,24 +273,28 @@ def build_deterministic_fallback(
 
 # ---------------------------------------------------------------------------
 # File ID extraction (from Volt LcmSummarize.extractFileIds)
+#
+# Volt stores large files separately and references them by ID in summaries.
+# ingest_sessions doesn't have that file store yet, so this is unused.
+# Kept for forward compatibility if we add large file storage later.
 # ---------------------------------------------------------------------------
 
-_FILE_ID_PATTERN = re.compile(
-    r"\[Large File Stored:\s*(file_[0-9a-f]{16})\]"
-    r"|\[Large User Text Stored:\s*(file_[0-9a-f]{16})\]"
-    r"|LCM File ID:\s*(file_[0-9a-f]{16})"
-    r'|file_id\s+"(file_[0-9a-f]{16})"'
-)
-
-
-def extract_file_ids(content: str) -> list[str]:
-    """Extract deduplicated, sorted file IDs from text."""
-    ids: set[str] = set()
-    for match in _FILE_ID_PATTERN.finditer(content):
-        fid = match.group(1) or match.group(2) or match.group(3) or match.group(4)
-        if fid:
-            ids.add(fid)
-    return sorted(ids)
+# _FILE_ID_PATTERN = re.compile(
+#     r"\[Large File Stored:\s*(file_[0-9a-f]{16})\]"
+#     r"|\[Large User Text Stored:\s*(file_[0-9a-f]{16})\]"
+#     r"|LCM File ID:\s*(file_[0-9a-f]{16})"
+#     r'|file_id\s+"(file_[0-9a-f]{16})"'
+# )
+#
+#
+# def extract_file_ids(content: str) -> list[str]:
+#     """Extract deduplicated, sorted file IDs from text."""
+#     ids: set[str] = set()
+#     for match in _FILE_ID_PATTERN.finditer(content):
+#         fid = match.group(1) or match.group(2) or match.group(3) or match.group(4)
+#         if fid:
+#             ids.add(fid)
+#     return sorted(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +307,6 @@ def _call_claude(system_prompt: str, user_message: str) -> str:
 
     Returns the text response. Raises on non-zero exit.
     """
-    # Build the full prompt with system context prepended
     full_prompt = f"<system>{system_prompt}</system>\n\n{user_message}"
     result = subprocess.run(
         ["claude", "--print", "-p", full_prompt, "--max-turns", "1"],
@@ -337,15 +359,15 @@ def summarize_messages(
 
     # Level 1: normal
     output = _call_claude(SUMMARIZE_D1_PROMPT, user_msg)
-    if should_accept_output(output, input_tokens):
+    if _should_accept_output(output, input_tokens):
         return output
 
     # Level 2: aggressive
     output = _call_claude(SUMMARIZE_D1_PROMPT + AGGRESSIVE_DIRECTIVE, user_msg)
-    if should_accept_output(output, input_tokens):
+    if _should_accept_output(output, input_tokens):
         return output
 
-    # Level 3: deterministic fallback
+    # Level 3: deterministic truncation (no LLM, always converges)
     return build_deterministic_fallback(formatted, input_tokens)
 
 
@@ -398,13 +420,13 @@ def condense_summaries(
 
     # Level 1: normal
     output = _call_claude(CONDENSE_D2_PROMPT, user_msg)
-    if should_accept_output(output, input_tokens):
+    if _should_accept_output(output, input_tokens):
         return output
 
     # Level 2: aggressive
     output = _call_claude(CONDENSE_D2_PROMPT + AGGRESSIVE_DIRECTIVE, user_msg)
-    if should_accept_output(output, input_tokens):
+    if _should_accept_output(output, input_tokens):
         return output
 
-    # Level 3: deterministic fallback
+    # Level 3: deterministic truncation (no LLM, always converges)
     return build_deterministic_fallback(formatted, input_tokens)
