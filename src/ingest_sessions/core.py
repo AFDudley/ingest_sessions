@@ -82,6 +82,20 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
             size_bytes BIGINT DEFAULT 0
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS summaries (
+            summary_id VARCHAR PRIMARY KEY,
+            session_id VARCHAR NOT NULL,
+            kind VARCHAR NOT NULL,
+            condensation_order INTEGER NOT NULL DEFAULT 1,
+            content TEXT NOT NULL,
+            token_count INTEGER NOT NULL,
+            parent_ids VARCHAR[] DEFAULT [],
+            message_uuids VARCHAR[] DEFAULT [],
+            file_ids VARCHAR[] DEFAULT [],
+            created_at BIGINT NOT NULL
+        )
+    """)
     migrate_history_pk(db)
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_records_session_id ON records(session_id)"
@@ -91,6 +105,10 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_history_session_id ON history(session_id)"
     )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_summaries_session_id ON summaries(session_id)"
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_summaries_kind ON summaries(kind)")
 
 
 # ---------------------------------------------------------------------------

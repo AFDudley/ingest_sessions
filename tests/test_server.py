@@ -465,6 +465,29 @@ async def run_http_server(
 
 
 @pytest.mark.asyncio
+async def test_summaries_table_exists(tmp_path: Path):
+    """The summaries table should exist after server startup."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.call_tool(
+            "query",
+            {
+                "sql": "SELECT column_name FROM information_schema.columns WHERE table_name = 'summaries' ORDER BY ordinal_position"
+            },
+        )
+        rows = json.loads(_text(result))
+        col_names = [r["column_name"] for r in rows]
+        assert "summary_id" in col_names
+        assert "session_id" in col_names
+        assert "kind" in col_names
+        assert "content" in col_names
+        assert "token_count" in col_names
+        assert "parent_ids" in col_names
+        assert "message_uuids" in col_names
+        assert "file_ids" in col_names
+        assert "created_at" in col_names
+
+
+@pytest.mark.asyncio
 async def test_http_query_and_refresh(tmp_path: Path):
     """Exercise query and refresh tools over the HTTP transport."""
     proj_dir = tmp_path / "projects" / "myproject"
