@@ -21,6 +21,7 @@ import duckdb
 from ingest_sessions.summarize import (
     condense_summaries,
     estimate_tokens,
+    extract_file_ids,
     generate_summary_id,
     summarize_messages,
 )
@@ -72,6 +73,7 @@ def insert_sprig(
     ts = int(time.time() * 1000)
     summary_id = generate_summary_id(content, ts)
     token_count = estimate_tokens(content)
+    file_ids = extract_file_ids(content)
     db.execute(
         "INSERT OR IGNORE INTO summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
@@ -83,7 +85,7 @@ def insert_sprig(
             token_count,
             [],  # parent_ids (sprigs have none)
             message_uuids,
-            [],  # file_ids (unused — Volt-specific)
+            file_ids,
             ts,
         ],
     )
@@ -100,6 +102,19 @@ def insert_bindle(
     ts = int(time.time() * 1000)
     summary_id = generate_summary_id(content, ts)
     token_count = estimate_tokens(content)
+
+    # Collect file_ids from all parent summaries
+    all_file_ids: list[str] = []
+    for pid in parent_ids:
+        row = db.execute(
+            "SELECT file_ids FROM summaries WHERE summary_id = ?", [pid]
+        ).fetchone()
+        if row and row[0]:
+            all_file_ids.extend(row[0])
+    # Also extract from bindle content itself
+    all_file_ids.extend(extract_file_ids(content))
+    file_ids = sorted(set(all_file_ids))
+
     db.execute(
         "INSERT OR IGNORE INTO summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
@@ -111,7 +126,7 @@ def insert_bindle(
             token_count,
             parent_ids,
             [],  # message_uuids (bindles link via parent sprigs)
-            [],  # file_ids (unused — Volt-specific)
+            file_ids,
             ts,
         ],
     )

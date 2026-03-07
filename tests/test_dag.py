@@ -153,3 +153,42 @@ def test_assemble_context_empty_session(db: duckdb.DuckDBPyConnection):
     """assemble_context_for_session returns None for empty sessions."""
     ctx = assemble_context_for_session(db, "nonexistent")
     assert ctx is None
+
+
+def test_sprig_captures_file_ids(db: duckdb.DuckDBPyConnection):
+    """Sprig insertion extracts file_ids from content."""
+    content = (
+        "The user read a large file.\n"
+        "[Large Content: file_abcdef0123456789] [Tokens: ~5000]\n"
+        "Then they asked about another.\n"
+        "[Large Content: file_1234567890abcdef] [Tokens: ~3000]"
+    )
+    summary_id = insert_sprig(db, "sess-001", content, ["msg-1", "msg-2"])
+    row = db.execute(
+        "SELECT file_ids FROM summaries WHERE summary_id = ?",
+        [summary_id],
+    ).fetchone()
+    assert row is not None
+    assert "file_abcdef0123456789" in row[0]
+    assert "file_1234567890abcdef" in row[0]
+
+
+def test_bindle_propagates_file_ids(db: duckdb.DuckDBPyConnection):
+    """Bindle collects file_ids from parent sprigs."""
+    content1 = "Summary with [Large Content: file_aaaa000000000000] [Tokens: ~1000]"
+    content2 = "Summary with [Large Content: file_bbbb000000000000] [Tokens: ~2000]"
+    insert_sprig(db, "sess-001", content1, ["msg-1"])
+    insert_sprig(db, "sess-001", content2, ["msg-2"])
+
+    sprigs = get_sprigs_for_session(db, "sess-001")
+    parent_ids = [s["summary_id"] for s in sprigs]
+    bindle_content = "Condensed summary mentioning both files."
+    bindle_id = insert_bindle(db, "sess-001", bindle_content, parent_ids)
+
+    row = db.execute(
+        "SELECT file_ids FROM summaries WHERE summary_id = ?",
+        [bindle_id],
+    ).fetchone()
+    assert row is not None
+    assert "file_aaaa000000000000" in row[0]
+    assert "file_bbbb000000000000" in row[0]

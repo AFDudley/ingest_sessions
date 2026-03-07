@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from typing import Any
@@ -274,29 +275,15 @@ def build_deterministic_fallback(
 
 
 # ---------------------------------------------------------------------------
-# File ID extraction (from Volt LcmSummarize.extractFileIds)
-#
-# Volt stores large files separately and references them by ID in summaries.
-# ingest_sessions doesn't have that file store yet, so this is unused.
-# Kept for forward compatibility if we add large file storage later.
+# File ID extraction — finds blob markers in summary content
 # ---------------------------------------------------------------------------
 
-# _FILE_ID_PATTERN = re.compile(
-#     r"\[Large File Stored:\s*(file_[0-9a-f]{16})\]"
-#     r"|\[Large User Text Stored:\s*(file_[0-9a-f]{16})\]"
-#     r"|LCM File ID:\s*(file_[0-9a-f]{16})"
-#     r'|file_id\s+"(file_[0-9a-f]{16})"'
-# )
-#
-#
-# def extract_file_ids(content: str) -> list[str]:
-#     """Extract deduplicated, sorted file IDs from text."""
-#     ids: set[str] = set()
-#     for match in _FILE_ID_PATTERN.finditer(content):
-#         fid = match.group(1) or match.group(2) or match.group(3) or match.group(4)
-#         if fid:
-#             ids.add(fid)
-#     return sorted(ids)
+_FILE_ID_PATTERN = re.compile(r"file_[0-9a-f]{16}")
+
+
+def extract_file_ids(content: str) -> list[str]:
+    """Extract deduplicated, sorted file IDs from text."""
+    return sorted(set(_FILE_ID_PATTERN.findall(content)))
 
 
 # ---------------------------------------------------------------------------
