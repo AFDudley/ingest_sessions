@@ -139,9 +139,11 @@ def _history_file() -> Path:
 
 def _ingest_file_full(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
     """Ingest records AND session metadata for a single JSONL file."""
+    from ingest_sessions.blobs import blob_dir
+
     _, prev_size = file_changed(db, jsonl_path)
     session_id = jsonl_path.stem
-    count = ingest_jsonl(db, jsonl_path, byte_offset=prev_size)
+    count = ingest_jsonl(db, jsonl_path, byte_offset=prev_size, blob_root=blob_dir())
     session_meta = build_session_metadata([jsonl_path.parent])
     ingest_session_metadata(db, session_id, session_meta)
     record_file(db, jsonl_path)
@@ -150,12 +152,15 @@ def _ingest_file_full(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
 
 def _ingest_all(db: duckdb.DuckDBPyConnection) -> None:
     """Incremental ingestion: only re-process files modified since last run."""
+    from ingest_sessions.blobs import blob_dir
+
     projects_dir = _projects_dir()
     if not projects_dir.exists():
         return
 
     project_dirs = sorted(d for d in projects_dir.iterdir() if d.is_dir())
     session_meta = build_session_metadata(project_dirs)
+    _blob_root = blob_dir()
 
     for proj_dir in project_dirs:
         for jsonl_path in sorted(proj_dir.glob("*.jsonl")):
@@ -163,7 +168,7 @@ def _ingest_all(db: duckdb.DuckDBPyConnection) -> None:
             if not changed:
                 continue
             session_id = jsonl_path.stem
-            ingest_jsonl(db, jsonl_path, byte_offset=prev_size)
+            ingest_jsonl(db, jsonl_path, byte_offset=prev_size, blob_root=_blob_root)
             ingest_session_metadata(db, session_id, session_meta)
             record_file(db, jsonl_path)
 
