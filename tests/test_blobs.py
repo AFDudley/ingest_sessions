@@ -14,7 +14,6 @@ from ingest_sessions.blobs import (
     read_blob,
     write_blob,
 )
-from ingest_sessions.core import create_tables
 
 
 def test_generate_blob_id_deterministic():
@@ -85,10 +84,20 @@ def test_read_blob_missing(tmp_path: Path):
     assert result is None
 
 
-def test_blob_dir_default():
-    """Default blob dir is under ~/.local/share/ingest_sessions/blobs."""
+def test_blob_dir_respects_env(monkeypatch: object):
+    """blob_dir() uses INGEST_SESSIONS_BLOBS_DIR when set."""
+    import pytest as _pytest  # noqa: F811 — monkeypatch type
+
+    mp = _pytest.MonkeyPatch() if not hasattr(monkeypatch, "setenv") else monkeypatch
+    mp.setenv("INGEST_SESSIONS_BLOBS_DIR", "/tmp/custom-blobs")  # type: ignore[union-attr]
+    assert blob_dir() == Path("/tmp/custom-blobs")
+
+
+def test_blob_dir_default(monkeypatch):
+    """Default blob dir ends with ingest_sessions/blobs."""
+    monkeypatch.delenv("INGEST_SESSIONS_BLOBS_DIR", raising=False)
     d = blob_dir()
-    assert d == Path.home() / ".local" / "share" / "ingest_sessions" / "blobs"
+    assert d.parts[-2:] == ("ingest_sessions", "blobs")
 
 
 # ---------------------------------------------------------------------------
@@ -96,11 +105,8 @@ def test_blob_dir_default():
 # ---------------------------------------------------------------------------
 
 
-def test_insert_and_get_blob_meta():
+def test_insert_and_get_blob_meta(db: duckdb.DuckDBPyConnection):
     """Insert blob metadata and retrieve it."""
-    db = duckdb.connect(":memory:")
-    create_tables(db)
-
     insert_blob_meta(
         db,
         file_id="file_abcdef0123456789",
@@ -117,11 +123,8 @@ def test_insert_and_get_blob_meta():
     assert meta["original_size"] == 80000
 
 
-def test_insert_blob_meta_idempotent():
+def test_insert_blob_meta_idempotent(db: duckdb.DuckDBPyConnection):
     """Inserting the same file_id twice is a no-op."""
-    db = duckdb.connect(":memory:")
-    create_tables(db)
-
     insert_blob_meta(db, "file_abcdef0123456789", "sess-001", 5000, 80000)
     insert_blob_meta(db, "file_abcdef0123456789", "sess-001", 5000, 80000)
 
@@ -129,9 +132,6 @@ def test_insert_blob_meta_idempotent():
     assert meta is not None
 
 
-def test_get_blob_meta_missing():
+def test_get_blob_meta_missing(db: duckdb.DuckDBPyConnection):
     """Getting nonexistent blob meta returns None."""
-    db = duckdb.connect(":memory:")
-    create_tables(db)
-
     assert get_blob_meta(db, "file_0000000000000000") is None

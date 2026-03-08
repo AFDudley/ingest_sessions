@@ -5,13 +5,10 @@ The summarization functions are mocked.
 """
 
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 import duckdb
-import pytest
 
-from ingest_sessions.core import create_tables
 from ingest_sessions.dag import (
     SPRIG_CHUNK_SIZE,
     assemble_context_for_session,
@@ -22,13 +19,6 @@ from ingest_sessions.dag import (
     insert_sprig,
     run_summarize_session,
 )
-
-
-@pytest.fixture
-def db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "test.duckdb"))
-    create_tables(conn)
-    return conn
 
 
 def _seed_records(
