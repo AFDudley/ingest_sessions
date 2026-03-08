@@ -201,6 +201,11 @@ async def _run_summarize_async(session_id: str) -> dict[str, int]:
     )
     previous_context = existing_sprigs[-1]["content"] if existing_sprigs else None
 
+    def _log(msg: str) -> None:
+        print(f"[ingest-sessions] summarize {session_id}: {msg}", file=sys.stderr)
+
+    _log(f"unsummarized={len(unsummarized)} existing_sprigs={len(existing_sprigs)}")
+
     sprigs_created = 0
     full_chunks = len(unsummarized) // SPRIG_CHUNK_SIZE
     for i in range(full_chunks):
@@ -221,11 +226,13 @@ async def _run_summarize_async(session_id: str) -> dict[str, int]:
     uncondensed = await _db_execute(
         partial(get_sprigs_for_session, session_id=session_id, uncondensed_only=True)
     )
+    _log(f"uncondensed={len(uncondensed)} threshold={BINDLE_THRESHOLD}")
     bindles_created = 0
     if len(uncondensed) >= BINDLE_THRESHOLD:
         bindle_context = await _db_execute(
             partial(get_latest_bindle_content, session_id=session_id)
         )
+        _log(f"condensing {len(uncondensed)} sprigs into bindle")
         content = await asyncio.to_thread(
             condense_summaries, uncondensed, bindle_context
         )
@@ -239,6 +246,7 @@ async def _run_summarize_async(session_id: str) -> dict[str, int]:
             )
         )
         bindles_created += 1
+        _log("bindle created")
 
     return {
         "sprigs_created": sprigs_created,

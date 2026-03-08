@@ -13,6 +13,7 @@ thread).  The server is responsible for calling them in the right context.
 
 from __future__ import annotations
 
+import sys
 import time
 from typing import Any
 
@@ -389,6 +390,11 @@ def run_summarize_session(
     existing_sprigs = get_sprigs_for_session(db, session_id)
     previous_context = existing_sprigs[-1]["content"] if existing_sprigs else None
 
+    def _log(msg: str) -> None:
+        print(f"[dag] {session_id}: {msg}", file=sys.stderr)
+
+    _log(f"unsummarized={len(unsummarized)} existing_sprigs={len(existing_sprigs)}")
+
     # Create sprigs from full chunks only (remainder stays for next run)
     full_chunks = len(unsummarized) // SPRIG_CHUNK_SIZE
     for i in range(full_chunks):
@@ -401,14 +407,17 @@ def run_summarize_session(
 
     # Condense uncondensed sprigs into a bindle if threshold met
     uncondensed = get_sprigs_for_session(db, session_id, uncondensed_only=True)
+    _log(f"uncondensed={len(uncondensed)} threshold={BINDLE_THRESHOLD}")
     if len(uncondensed) >= BINDLE_THRESHOLD:
         bindle_context = get_latest_bindle_content(db, session_id)
+        _log(f"condensing {len(uncondensed)} sprigs into bindle")
         content = condense_summaries(
             uncondensed, previous_summary_context=bindle_context
         )
         parent_ids = [s["summary_id"] for s in uncondensed]
         insert_bindle(db, session_id, content, parent_ids)
         bindles_created += 1
+        _log("bindle created")
 
     return {
         "sprigs_created": sprigs_created,

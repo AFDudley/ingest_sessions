@@ -5,13 +5,16 @@ without LLM calls. LLM-dependent tests use mocks.
 """
 
 import json
+from unittest.mock import patch
 
 from ingest_sessions.summarize import (
     _should_accept_output,
     build_deterministic_fallback,
+    condense_summaries,
     estimate_tokens,
     format_messages_for_summary,
     generate_summary_id,
+    summarize_messages,
 )
 
 
@@ -99,3 +102,47 @@ def test_estimate_tokens():
     """Rough token estimation works."""
     tokens = estimate_tokens("hello world this is a test")
     assert 4 <= tokens <= 10  # ~6 tokens, rough estimate
+
+
+def test_summarize_messages_falls_back_on_llm_failure():
+    """summarize_messages uses deterministic fallback when _call_claude raises."""
+    records = [
+        {
+            "uuid": f"r{i}",
+            "type": "user",
+            "raw": json.dumps(
+                {"message": {"role": "user", "content": f"Message {i} " + "x" * 100}}
+            ),
+        }
+        for i in range(5)
+    ]
+    with patch(
+        "ingest_sessions.summarize._call_claude",
+        side_effect=RuntimeError("claude --print failed"),
+    ):
+        result = summarize_messages(records)
+
+    # Should fall through to deterministic fallback, not raise
+    assert "truncated" in result.lower()
+    assert len(result) > 0
+
+
+def test_condense_summaries_falls_back_on_llm_failure():
+    """condense_summaries uses deterministic fallback when _call_claude raises."""
+    summaries = [
+        {
+            "summary_id": f"sum_{i:016x}",
+            "content": f"Sprig summary {i} with enough content " + "y" * 200,
+            "token_count": 100,
+        }
+        for i in range(6)
+    ]
+    with patch(
+        "ingest_sessions.summarize._call_claude",
+        side_effect=TimeoutError("subprocess timed out"),
+    ):
+        result = condense_summaries(summaries)
+
+    # Should fall through to deterministic fallback, not raise
+    assert "truncated" in result.lower()
+    assert len(result) > 0

@@ -10,6 +10,7 @@ from unittest.mock import patch
 import duckdb
 
 from ingest_sessions.dag import (
+    BINDLE_THRESHOLD,
     SPRIG_CHUNK_SIZE,
     assemble_context_for_session,
     get_latest_summary_for_session,
@@ -128,6 +129,72 @@ def test_run_summarize_session_creates_sprigs(db: duckdb.DuckDBPyConnection):
     assert result["sprigs_created"] == 2  # 2 full chunks, remainder < chunk size
     sprigs = get_sprigs_for_session(db, "sess-1")
     assert len(sprigs) == 2
+
+
+def test_run_summarize_session_creates_bindles(db: duckdb.DuckDBPyConnection):
+    """run_summarize_session condenses sprigs into bindles when threshold met."""
+    # Seed enough messages for BINDLE_THRESHOLD + 1 full chunks
+    record_count = SPRIG_CHUNK_SIZE * (BINDLE_THRESHOLD + 1)
+    _seed_records(db, "sess-1", record_count)
+
+    call_count = {"summarize": 0, "condense": 0}
+
+    def mock_summarize(records, previous_summary_context=None):
+        call_count["summarize"] += 1
+        return f"mock sprig summary {call_count['summarize']}"
+
+    def mock_condense(summaries, previous_summary_context=None):
+        call_count["condense"] += 1
+        return f"mock bindle from {len(summaries)} sprigs"
+
+    with patch("ingest_sessions.dag.summarize_messages", side_effect=mock_summarize):
+        with patch("ingest_sessions.dag.condense_summaries", side_effect=mock_condense):
+            result = run_summarize_session(db, "sess-1")
+
+    assert result["sprigs_created"] == BINDLE_THRESHOLD + 1
+    assert result["bindles_created"] == 1
+    assert call_count["condense"] == 1
+
+    # Verify bindle exists in DB
+    row = db.execute(
+        "SELECT kind, content FROM summaries WHERE kind = 'bindle'"
+    ).fetchone()
+    assert row is not None
+    assert "mock bindle" in row[1]
+
+    # Verify uncondensed count is 0 (all sprigs consumed)
+    uncondensed = get_sprigs_for_session(db, "sess-1", uncondensed_only=True)
+    assert len(uncondensed) == 0
+
+
+def test_run_summarize_session_condenses_preexisting_sprigs(
+    db: duckdb.DuckDBPyConnection,
+):
+    """run_summarize_session creates bindles from pre-existing sprigs."""
+    # Pre-create sprigs (simulating prior runs)
+    for i in range(BINDLE_THRESHOLD + 2):
+        uuids = [f"rec-{i}-{j}" for j in range(3)]
+        for uuid in uuids:
+            raw = json.dumps({"message": {"role": "user", "content": f"Msg {uuid}"}})
+            db.execute(
+                "INSERT OR IGNORE INTO records VALUES (?, ?, ?, ?, ?, ?)",
+                [uuid, "sess-1", "user", f"2026-03-01T10:{i:02d}:00.000Z", None, raw],
+            )
+        insert_sprig(db, "sess-1", f"pre-existing sprig {i}", uuids)
+
+    uncondensed_before = get_sprigs_for_session(db, "sess-1", uncondensed_only=True)
+    assert len(uncondensed_before) >= BINDLE_THRESHOLD
+
+    def mock_condense(summaries, previous_summary_context=None):
+        return f"condensed {len(summaries)} sprigs"
+
+    # No new messages, but should still condense existing sprigs
+    with patch("ingest_sessions.dag.summarize_messages", return_value="unused"):
+        with patch("ingest_sessions.dag.condense_summaries", side_effect=mock_condense):
+            result = run_summarize_session(db, "sess-1")
+
+    assert result["sprigs_created"] == 0  # no new messages
+    assert result["bindles_created"] == 1
 
 
 def test_assemble_context_includes_tail(db: duckdb.DuckDBPyConnection):

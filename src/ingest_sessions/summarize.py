@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from typing import Any
 
 
@@ -374,14 +375,20 @@ def summarize_messages(
         )
 
     # Level 1: normal
-    output = _call_claude(SUMMARIZE_D1_PROMPT, user_msg)
-    if _should_accept_output(output, input_tokens):
-        return output
+    try:
+        output = _call_claude(SUMMARIZE_D1_PROMPT, user_msg)
+        if _should_accept_output(output, input_tokens):
+            return output
+    except Exception as exc:
+        print(f"[summarize] level 1 failed: {exc}", file=sys.stderr)
 
     # Level 2: aggressive
-    output = _call_claude(SUMMARIZE_D1_PROMPT + AGGRESSIVE_DIRECTIVE, user_msg)
-    if _should_accept_output(output, input_tokens):
-        return output
+    try:
+        output = _call_claude(SUMMARIZE_D1_PROMPT + AGGRESSIVE_DIRECTIVE, user_msg)
+        if _should_accept_output(output, input_tokens):
+            return output
+    except Exception as exc:
+        print(f"[summarize] level 2 failed: {exc}", file=sys.stderr)
 
     # Level 3: deterministic truncation (no LLM, always converges)
     return build_deterministic_fallback(formatted, input_tokens)
@@ -435,14 +442,20 @@ def condense_summaries(
         )
 
     # Level 1: normal
-    output = _call_claude(CONDENSE_D2_PROMPT, user_msg)
-    if _should_accept_output(output, input_tokens):
-        return output
+    try:
+        output = _call_claude(CONDENSE_D2_PROMPT, user_msg)
+        if _should_accept_output(output, input_tokens):
+            return output
+    except Exception as exc:
+        print(f"[condense] level 1 failed: {exc}", file=sys.stderr)
 
     # Level 2: aggressive
-    output = _call_claude(CONDENSE_D2_PROMPT + AGGRESSIVE_DIRECTIVE, user_msg)
-    if _should_accept_output(output, input_tokens):
-        return output
+    try:
+        output = _call_claude(CONDENSE_D2_PROMPT + AGGRESSIVE_DIRECTIVE, user_msg)
+        if _should_accept_output(output, input_tokens):
+            return output
+    except Exception as exc:
+        print(f"[condense] level 2 failed: {exc}", file=sys.stderr)
 
     # Level 3: deterministic truncation (no LLM, always converges)
     return build_deterministic_fallback(formatted, input_tokens)
