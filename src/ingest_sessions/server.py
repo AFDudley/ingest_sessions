@@ -143,10 +143,12 @@ def _ingest_file_full(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
 
     _, prev_size = file_changed(db, jsonl_path)
     session_id = jsonl_path.stem
-    count = ingest_jsonl(db, jsonl_path, byte_offset=prev_size, blob_root=blob_dir())
+    count, bytes_read = ingest_jsonl(
+        db, jsonl_path, byte_offset=prev_size, blob_root=blob_dir()
+    )
     session_meta = build_session_metadata([jsonl_path.parent])
     ingest_session_metadata(db, session_id, session_meta)
-    record_file(db, jsonl_path)
+    record_file(db, jsonl_path, size_bytes=bytes_read)
     return count
 
 
@@ -168,9 +170,11 @@ def _ingest_all(db: duckdb.DuckDBPyConnection) -> None:
             if not changed:
                 continue
             session_id = jsonl_path.stem
-            ingest_jsonl(db, jsonl_path, byte_offset=prev_size, blob_root=_blob_root)
+            _, bytes_read = ingest_jsonl(
+                db, jsonl_path, byte_offset=prev_size, blob_root=_blob_root
+            )
             ingest_session_metadata(db, session_id, session_meta)
-            record_file(db, jsonl_path)
+            record_file(db, jsonl_path, size_bytes=bytes_read)
 
     history = _history_file()
     if history.exists():

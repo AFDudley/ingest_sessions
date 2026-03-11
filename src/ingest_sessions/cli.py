@@ -124,7 +124,7 @@ def ingest(config: IngestConfig) -> None:
                 continue
 
             session_id = jsonl_path.stem
-            count = ingest_jsonl(db, jsonl_path)
+            count, _ = ingest_jsonl(db, jsonl_path)
             ingest_session_metadata(db, session_id, session_meta)
             total_records += count
             proj_sessions += 1

@@ -75,7 +75,7 @@ class TestIngestJsonl:
     ) -> None:
         jsonl = tmp_path / "sess-001.jsonl"
         jsonl.write_text(json.dumps(SAMPLE_RECORD) + "\n")
-        count = ingest_jsonl(db, jsonl)
+        count, _ = ingest_jsonl(db, jsonl)
         assert count == 1
         rows = db.execute("SELECT uuid, session_id, type FROM records").fetchall()
         assert rows == [("abc-123", "sess-001", "user")]
@@ -85,7 +85,7 @@ class TestIngestJsonl:
     ) -> None:
         jsonl = tmp_path / "sess-002.jsonl"
         jsonl.write_text(json.dumps(SAMPLE_RECORD) + "\nnot valid json\n\n")
-        count = ingest_jsonl(db, jsonl)
+        count, _ = ingest_jsonl(db, jsonl)
         assert count == 1
 
     def test_byte_offset_skips_earlier_content(
@@ -102,7 +102,7 @@ class TestIngestJsonl:
 
         # Offset into middle of line1 — readline() skips remainder of line1,
         # then reads line2 and line3
-        count = ingest_jsonl(db, jsonl, byte_offset=5)
+        count, _ = ingest_jsonl(db, jsonl, byte_offset=5)
         assert count == 2
         uuids = {r[0] for r in db.execute("SELECT uuid FROM records").fetchall()}
         assert uuids == {"r2", "r3"}
@@ -251,6 +251,95 @@ class TestSessionMetadata:
         assert row is not None
         assert row[0] == 2
         assert row[1] == "my prompt"
+
+
+class TestRefreshAppendedRecords:
+    """Regression test: refresh must pick up records appended after initial ingest.
+
+    The bug: record_file() captures path.stat().st_size at call time, but the
+    file may have grown *during* ingest_jsonl(). On next refresh, file_changed()
+    sees the mtime matches and returns the recorded size as prev_size, so
+    ingest_jsonl seeks to EOF and reads nothing — even though not all records
+    were ingested.
+    """
+
+    def test_refresh_picks_up_appended_records(
+        self, db: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """Ingest 5 records, append 3 more, refresh should find the 3 new ones."""
+        jsonl = tmp_path / "sess-append.jsonl"
+
+        # Write 5 initial records
+        records_initial = []
+        for i in range(5):
+            r = {**SAMPLE_RECORD, "uuid": f"initial-{i}"}
+            records_initial.append(json.dumps(r))
+        jsonl.write_text("\n".join(records_initial) + "\n")
+
+        # Ingest the initial file
+        count, bytes_read = ingest_jsonl(db, jsonl)
+        assert count == 5
+
+        # Record the file with the actual bytes read offset (not stat size)
+        record_file(db, jsonl, size_bytes=bytes_read)
+
+        # Append 3 more records (simulating writes during/after ingest)
+        with open(jsonl, "a") as f:
+            for i in range(3):
+                r = {**SAMPLE_RECORD, "uuid": f"appended-{i}"}
+                f.write(json.dumps(r) + "\n")
+
+        time.sleep(0.01)  # ensure mtime changes
+
+        # Refresh: file_changed should detect the change
+        changed, prev_size = file_changed(db, jsonl)
+        assert changed is True, "file_changed must detect appended content"
+
+        # Ingest from prev_size offset
+        new_count, _ = ingest_jsonl(db, jsonl, byte_offset=prev_size)
+        assert new_count == 3, f"Expected 3 new records, got {new_count}"
+
+        # All 8 records in DB
+        total = db.execute("SELECT count(*) FROM records").fetchone()
+        assert total is not None
+        assert total[0] == 8
+
+    def test_record_file_with_explicit_size(
+        self, db: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """record_file should use explicit size_bytes when provided."""
+        f = tmp_path / "test.jsonl"
+        f.write_text("data\nmore data\n")
+        actual_size = f.stat().st_size
+
+        # Record with a smaller size (simulating partial read)
+        record_file(db, f, size_bytes=5)
+
+        row = db.execute(
+            "SELECT size_bytes FROM file_mtimes WHERE file_path = ?",
+            [str(f)],
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 5, f"Expected recorded size 5, got {row[0]}"
+        assert row[0] != actual_size
+
+    def test_ingest_jsonl_returns_bytes_read(
+        self, db: duckdb.DuckDBPyConnection, tmp_path: Path
+    ) -> None:
+        """ingest_jsonl should return (count, bytes_read) tuple."""
+        r1 = {**SAMPLE_RECORD, "uuid": "br-1"}
+        r2 = {**SAMPLE_RECORD, "uuid": "br-2"}
+        line1 = json.dumps(r1) + "\n"
+        line2 = json.dumps(r2) + "\n"
+        jsonl = tmp_path / "sess-bytes.jsonl"
+        jsonl.write_text(line1 + line2)
+
+        result = ingest_jsonl(db, jsonl)
+        # Should now return a tuple (count, bytes_read)
+        assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
+        count, bytes_read = result
+        assert count == 2
+        assert bytes_read == len(line1.encode()) + len(line2.encode())
 
 
 class TestFileChanged:

@@ -302,8 +302,13 @@ def ingest_jsonl(
     jsonl_path: Path,
     byte_offset: int = 0,
     blob_root: Path | None = None,
-) -> int:
-    """Ingest a single JSONL session file.  Returns record count.
+) -> tuple[int, int]:
+    """Ingest a single JSONL session file.
+
+    Returns (record_count, bytes_read) where bytes_read is the byte offset
+    up to which the file was actually consumed.  Callers should pass
+    bytes_read to record_file() so that future incremental ingestion starts
+    at the correct position — even if the file grew while we were reading.
 
     When byte_offset > 0, only lines after that offset are read (JSONL is
     append-only).  The first partial line after the offset is silently
@@ -316,8 +321,15 @@ def ingest_jsonl(
     with open(jsonl_path, "r") as f:
         if byte_offset > 0:
             f.seek(byte_offset)
-            f.readline()  # skip potential partial line at boundary
+            # If we landed mid-line, skip the partial remainder.
+            # Check the byte just before the offset: if it's not a newline
+            # (or offset is 0), we're mid-line and must skip forward.
+            f.seek(byte_offset - 1)
+            ch = f.read(1)
+            if ch != "\n":
+                f.readline()  # skip remainder of partial line
         text = f.read()
+        end_offset = f.tell()
 
     batch = []
     session_id = jsonl_path.stem
@@ -349,7 +361,7 @@ def ingest_jsonl(
             "INSERT OR IGNORE INTO records VALUES (?, ?, ?, ?, ?, ?)",
             batch,
         )
-    return len(batch)
+    return len(batch), end_offset
 
 
 def ingest_history(
@@ -408,10 +420,22 @@ def file_changed(db: duckdb.DuckDBPyConnection, path: Path) -> tuple[bool, int]:
     return True, prev_size
 
 
-def record_file(db: duckdb.DuckDBPyConnection, path: Path) -> None:
-    """Record a file's current mtime and size after successful ingestion."""
+def record_file(
+    db: duckdb.DuckDBPyConnection, path: Path, *, size_bytes: int | None = None
+) -> None:
+    """Record a file's mtime and the byte offset actually consumed.
+
+    When *size_bytes* is provided it is used instead of ``path.stat().st_size``.
+    This prevents the race where the file grows during ingestion: we record
+    only as far as we actually read, so the next incremental run picks up
+    from the right place.
+    """
     stat = path.stat()
     db.execute(
         "INSERT OR REPLACE INTO file_mtimes VALUES (?, ?, ?)",
-        [str(path), stat.st_mtime_ns, stat.st_size],
+        [
+            str(path),
+            stat.st_mtime_ns,
+            size_bytes if size_bytes is not None else stat.st_size,
+        ],
     )

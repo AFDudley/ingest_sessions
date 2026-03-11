@@ -148,7 +148,7 @@ def test_re_ingestion_does_not_re_extract_markers(
 
     # Second ingestion of the SAME file — original large content is still
     # in the JSONL on disk, but INSERT OR IGNORE skips the duplicate uuid.
-    count = ingest_jsonl(db, jsonl, blob_root=blob_root)
+    count, _ = ingest_jsonl(db, jsonl, blob_root=blob_root)
     assert count == 1  # line was parsed but INSERT OR IGNORE skipped it
 
     # Record is unchanged
