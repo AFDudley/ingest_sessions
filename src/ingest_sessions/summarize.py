@@ -327,15 +327,16 @@ def _call_claude(system_prompt: str, user_message: str) -> str:
             "1",
         ],
         capture_output=True,
-        text=True,
+        text=False,
         timeout=120,
         env=env,
     )
+    stderr = result.stderr.decode("utf-8", errors="replace").replace("\x00", "")
     if result.returncode != 0:
         raise RuntimeError(
-            f"claude --print failed (exit {result.returncode}): {result.stderr[:500]}"
+            f"claude --print failed (exit {result.returncode}): {stderr[:500]}"
         )
-    return result.stdout.strip()
+    return result.stdout.decode("utf-8", errors="replace").replace("\x00", "").strip()
 
 
 def summarize_messages(

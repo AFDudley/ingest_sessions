@@ -8,6 +8,7 @@ import json
 from unittest.mock import patch
 
 from ingest_sessions.summarize import (
+    _call_claude,
     _should_accept_output,
     build_deterministic_fallback,
     condense_summaries,
@@ -146,3 +147,41 @@ def test_condense_summaries_falls_back_on_llm_failure():
     # Should fall through to deterministic fallback, not raise
     assert "truncated" in result.lower()
     assert len(result) > 0
+
+
+def test_call_claude_handles_null_bytes():
+    """_call_claude replaces null bytes instead of crashing."""
+    stdout_with_null = b"hello\x00world"
+    stderr_bytes = b""
+    mock_result = type(
+        "CompletedProcess",
+        (),
+        {"returncode": 0, "stdout": stdout_with_null, "stderr": stderr_bytes},
+    )()
+    with patch(
+        "ingest_sessions.summarize._find_claude", return_value="/usr/bin/claude"
+    ):
+        with patch("subprocess.run", return_value=mock_result):
+            output = _call_claude("system", "user")
+    assert "\x00" not in output
+    assert "hello" in output
+    assert "world" in output
+
+
+def test_call_claude_null_bytes_in_stderr():
+    """_call_claude handles null bytes in stderr on failure."""
+    mock_result = type(
+        "CompletedProcess",
+        (),
+        {"returncode": 1, "stdout": b"", "stderr": b"error\x00msg"},
+    )()
+    with patch(
+        "ingest_sessions.summarize._find_claude", return_value="/usr/bin/claude"
+    ):
+        with patch("subprocess.run", return_value=mock_result):
+            try:
+                _call_claude("system", "user")
+                assert False, "Should have raised"
+            except RuntimeError as exc:
+                assert "error" in str(exc)
+                assert "\x00" not in str(exc)
