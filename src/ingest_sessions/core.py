@@ -318,18 +318,32 @@ def ingest_jsonl(
     blob store and replaced with compact markers before insertion into
     DuckDB.  See blobs.py for threshold and storage details.
     """
-    with open(jsonl_path, "r") as f:
+    with open(jsonl_path, "rb") as f:
         if byte_offset > 0:
-            f.seek(byte_offset)
             # If we landed mid-line, skip the partial remainder.
             # Check the byte just before the offset: if it's not a newline
             # (or offset is 0), we're mid-line and must skip forward.
             f.seek(byte_offset - 1)
             ch = f.read(1)
-            if ch != "\n":
+            if ch != b"\n":
                 f.readline()  # skip remainder of partial line
-        text = f.read()
-        end_offset = f.tell()
+        raw = f.read()
+
+    # Trim any partial line at the end of the read.  When a file is
+    # being actively appended to (e.g. Claude Code streaming a response),
+    # f.read() may capture an incomplete trailing JSON line.  If we
+    # include those bytes in end_offset, the next incremental pass will
+    # start *past* that line — and the mid-line skip logic will discard
+    # whatever remains of it, permanently losing the record.
+    if raw and not raw.endswith(b"\n"):
+        last_nl = raw.rfind(b"\n")
+        if last_nl >= 0:
+            raw = raw[: last_nl + 1]
+        else:
+            raw = b""
+
+    text = raw.decode("utf-8", errors="replace")
+    end_offset = byte_offset + len(raw)
 
     batch = []
     session_id = jsonl_path.stem
