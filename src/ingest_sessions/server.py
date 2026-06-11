@@ -59,6 +59,7 @@ from ingest_sessions.core import (
     ingest_jsonl,
     ingest_session_metadata,
     record_file,
+    register_functions,
 )
 
 T = TypeVar("T")
@@ -271,6 +272,7 @@ def _db_loop() -> None:
     db = duckdb.connect(path)
     try:
         create_tables(db)
+        register_functions(db)
         _ingest_all(db)
         _startup_done.set()
 
@@ -369,7 +371,14 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="query",
-            description="Execute a SQL query against the sessions database.",
+            description=(
+                "Execute a SQL query against the sessions database. "
+                "Content blocks over 100KB are offloaded to a blob store "
+                "and appear in records.raw as '[Large Content: file_...]' "
+                "markers; rehydrate them with the SQL function "
+                "read_blob(file_id). Blob metadata is in the blob_meta "
+                "table; unparseable transcript lines are in malformed_lines."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {

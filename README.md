@@ -116,6 +116,18 @@ Plain HTTP endpoints for hooks (bypass MCP protocol overhead):
 | `records` | Individual transcript entries — one row per JSONL line (uuid, session_id, type, timestamp, raw JSON) |
 | `history` | Command history entries from `~/.claude/history.jsonl` |
 | `summaries` | Summary DAG nodes (sprigs, bindles) with content, token counts, parent links |
+| `blob_meta` | Metadata for content blocks offloaded to the blob store (file_id, session, token count, size) |
+| `malformed_lines` | Transcript lines that failed JSON parsing — captured with file path and byte offset, never dropped |
+| `schema_meta` | Schema version markers for one-time migrations |
+
+### Capture invariant
+
+Every non-blank transcript line lands in exactly one of `records` or
+`malformed_lines`. Records without a `uuid` get a deterministic surrogate
+key (`nouuid_<session>_<hash>`). Content blocks over 100KB are offloaded to
+`~/.local/share/ingest_sessions/blobs/` and replaced in `records.raw` with
+`[Large Content: file_...]` markers — rehydrate them in SQL with
+`read_blob(file_id)` via the `query` tool.
 
 ## Configuration
 

@@ -358,6 +358,26 @@ def assemble_context_for_session(
                 parts.append("[could not extract content]")
             parts.append("")
 
+    # Large content offloaded to the blob store during ingestion.  List it
+    # so a recovered session knows what exists and how to retrieve it —
+    # bodies are not inlined because they were extracted precisely for
+    # being too large.  See pebble is-a1f.
+    blob_rows = db.execute(
+        """
+        SELECT file_id, token_count FROM blob_meta
+        WHERE session_id = ?
+        ORDER BY created_at ASC
+        """,
+        [session_id],
+    ).fetchall()
+    if blob_rows:
+        parts.append("## Referenced Large Content (blob store)")
+        parts.append("")
+        parts.append("Retrieve via the query tool, e.g. SELECT read_blob('<file_id>')")
+        for file_id, token_count in blob_rows:
+            parts.append(f"- {file_id} (~{token_count} tokens)")
+        parts.append("")
+
     return "\n".join(parts)
 
 

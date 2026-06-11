@@ -7,7 +7,9 @@ from here.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +42,53 @@ def migrate_history_pk(db: duckdb.DuckDBPyConnection) -> None:
     """)
     db.execute("INSERT OR IGNORE INTO history SELECT * FROM history_new")
     db.execute("DROP TABLE history_new")
+
+
+def migrate_capture_v2(db: duckdb.DuckDBPyConnection) -> None:
+    """One-time backfill for the 100%-capture invariant (pebble is-a1f).
+
+    Earlier versions collapsed every uuid-less record onto the empty-string
+    primary key, silently dropping all but the first.  Delete the lone
+    survivor and clear file_mtimes so the next ingestion pass re-reads every
+    JSONL file from offset 0.  INSERT OR IGNORE makes the re-ingest
+    idempotent, and the dropped lines are recovered from the files on disk.
+    """
+    row = db.execute(
+        "SELECT value FROM schema_meta WHERE key = 'capture_v2'"
+    ).fetchone()
+    if row:
+        return
+    db.execute("DELETE FROM records WHERE uuid = ''")
+    db.execute("DELETE FROM file_mtimes")
+    db.execute("INSERT INTO schema_meta VALUES ('capture_v2', 'done')")
+
+
+def register_functions(
+    db: duckdb.DuckDBPyConnection, blob_root: Path | None = None
+) -> None:
+    """Register SQL helpers on this connection.
+
+    ``read_blob(file_id)`` rehydrates content that ingestion offloaded to
+    the blob store (see blobs.py), so 100% of transcript content is
+    reachable through SQL.  Returns NULL for unknown file_ids.
+
+    Implemented as a SQL macro over read_text() — a Python UDF would pull
+    in numpy (required by duckdb.create_function).  Macros persist in the
+    database file, so CREATE OR REPLACE on every startup keeps the blob
+    path current.  Limitation: read_text() binds at plan time, so the
+    argument must be a literal — read_blob(column_ref) does not work.
+    """
+    from ingest_sessions.blobs import blob_dir
+
+    root = str(blob_root if blob_root is not None else blob_dir())
+    root_sql = root.replace("'", "''")
+    db.execute(f"""
+        CREATE OR REPLACE MACRO read_blob(file_id) AS (
+            SELECT content FROM read_text(
+                '{root_sql}/' || substr(file_id, 6, 2) || '/' || file_id
+            )
+        )
+    """)
 
 
 def create_tables(db: duckdb.DuckDBPyConnection) -> None:
@@ -105,7 +154,23 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
             created_at BIGINT NOT NULL
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS malformed_lines (
+            file_path VARCHAR,
+            byte_offset BIGINT,
+            line_text VARCHAR,
+            ingested_at BIGINT NOT NULL,
+            PRIMARY KEY (file_path, byte_offset)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key VARCHAR PRIMARY KEY,
+            value VARCHAR
+        )
+    """)
     migrate_history_pk(db)
+    migrate_capture_v2(db)
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_records_session_id ON records(session_id)"
     )
@@ -235,11 +300,14 @@ def _extract_blobs(
     record: dict,
     session_id: str,
     blob_root: Path,
-) -> None:
+) -> bool:
     """Extract large content blocks from a record, mutating it in place.
 
     Writes blobs to disk, records metadata in DuckDB, and replaces
     content with compact markers.
+
+    Returns True if the record was modified.  Callers use this to avoid
+    re-serializing untouched records, preserving their original bytes.
     """
     from ingest_sessions.blobs import (
         insert_blob_meta,
@@ -247,12 +315,13 @@ def _extract_blobs(
         write_blob,
     )
 
+    modified = False
     msg = record.get("message")
     if not isinstance(msg, dict):
-        return
+        return False
     content = msg.get("content")
     if content is None:
-        return
+        return False
 
     # Case 1: content is a plain string
     if isinstance(content, str) and is_large_content(content):
@@ -260,11 +329,11 @@ def _extract_blobs(
         token_count = len(content) // 4
         insert_blob_meta(db, file_id, session_id, token_count, len(content))
         msg["content"] = _make_blob_marker(file_id, token_count)
-        return
+        return True
 
     # Case 2: content is a list of blocks
     if not isinstance(content, list):
-        return
+        return False
     for block in content:
         if not isinstance(block, dict):
             continue
@@ -275,6 +344,7 @@ def _extract_blobs(
                 token_count = len(text) // 4
                 insert_blob_meta(db, file_id, session_id, token_count, len(text))
                 block["text"] = _make_blob_marker(file_id, token_count)
+                modified = True
         elif block.get("type") == "tool_result":
             result_content = block.get("content", "")
             if isinstance(result_content, str) and is_large_content(result_content):
@@ -284,6 +354,7 @@ def _extract_blobs(
                     db, file_id, session_id, token_count, len(result_content)
                 )
                 block["content"] = _make_blob_marker(file_id, token_count)
+                modified = True
             elif isinstance(result_content, list):
                 for sub in result_content:
                     if isinstance(sub, dict) and sub.get("type") == "text":
@@ -295,6 +366,8 @@ def _extract_blobs(
                                 db, file_id, session_id, token_count, len(text)
                             )
                             sub["text"] = _make_blob_marker(file_id, token_count)
+                            modified = True
+    return modified
 
 
 def ingest_jsonl(
@@ -317,6 +390,14 @@ def ingest_jsonl(
     When blob_root is provided, large content blocks are extracted to the
     blob store and replaced with compact markers before insertion into
     DuckDB.  See blobs.py for threshold and storage details.
+
+    Capture invariant (pebble is-a1f): every non-blank line in the consumed
+    byte range lands in exactly one of two tables — parseable dict records
+    in ``records``, everything else in ``malformed_lines``.  Records without
+    a uuid get a deterministic surrogate key (content hash of the original
+    line bytes) so they cannot collide on the primary key.  Records whose
+    content was not modified by blob extraction are stored byte-for-byte
+    as they appeared in the file.
     """
     with open(jsonl_path, "rb") as f:
         if byte_offset > 0:
@@ -327,6 +408,9 @@ def ingest_jsonl(
             ch = f.read(1)
             if ch != b"\n":
                 f.readline()  # skip remainder of partial line
+        # Actual position data begins at — accounts for any skipped
+        # partial line, unlike assuming byte_offset.
+        data_start = f.tell()
         raw = f.read()
 
     # Trim any partial line at the end of the read.  When a file is
@@ -342,27 +426,47 @@ def ingest_jsonl(
         else:
             raw = b""
 
-    text = raw.decode("utf-8", errors="replace")
-    end_offset = byte_offset + len(raw)
+    end_offset = data_start + len(raw)
 
     batch = []
+    malformed = []
+    now_ms = int(time.time() * 1000)
     session_id = jsonl_path.stem
-    for line in text.splitlines():
-        if not line.strip():
+    pos = data_start
+    for raw_line in raw.split(b"\n"):
+        line_start = pos
+        pos += len(raw_line) + 1
+        if not raw_line.strip():
             continue
+        line = raw_line.decode("utf-8", errors="replace")
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            record = None
+        if not isinstance(record, dict):
+            # Not a parseable JSON object — capture it rather than drop it.
+            malformed.append((str(jsonl_path), line_start, line, now_ms))
             continue
 
-        # Extract large content blocks to blob store
-        if blob_root is not None:
-            _extract_blobs(db, record, session_id, blob_root)
+        # uuid is the records PRIMARY KEY.  Lines without one must get a
+        # distinct deterministic key — mapping them all to '' would let
+        # INSERT OR IGNORE silently drop every one after the first.
+        # Hash the original line bytes (pre-blob-extraction) so the key
+        # is stable regardless of blob threshold changes.
+        rec_uuid = record.get("uuid")
+        if not rec_uuid:
+            digest = hashlib.sha256(raw_line).hexdigest()[:16]
+            rec_uuid = f"nouuid_{session_id}_{digest}"
+
+        # Extract large content blocks to blob store.  Only re-serialize
+        # when extraction actually modified the record — otherwise store
+        # the original line bytes verbatim.
+        if blob_root is not None and _extract_blobs(db, record, session_id, blob_root):
             line = json.dumps(record)
 
         batch.append(
             (
-                record.get("uuid", ""),
+                rec_uuid,
                 record.get("sessionId", session_id),
                 record.get("type", ""),
                 record.get("timestamp"),
@@ -374,6 +478,11 @@ def ingest_jsonl(
         db.executemany(
             "INSERT OR IGNORE INTO records VALUES (?, ?, ?, ?, ?, ?)",
             batch,
+        )
+    if malformed:
+        db.executemany(
+            "INSERT OR IGNORE INTO malformed_lines VALUES (?, ?, ?, ?)",
+            malformed,
         )
     return len(batch), end_offset
 
