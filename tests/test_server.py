@@ -498,6 +498,74 @@ async def test_server_lists_summarize_tool(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_server_lists_get_session_tool(tmp_path: Path):
+    """The server should list 'get_session' as an available tool."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.list_tools()
+        assert "get_session" in [t.name for t in result.tools]
+
+
+@pytest.mark.asyncio
+async def test_get_session_rehydrates_blob_e2e(tmp_path: Path):
+    """get_session reassembles a session whose content exceeds the blob threshold.
+
+    Drives the running server over stdio with an isolated blob store: a record
+    larger than the 100KB inline threshold is offloaded on ingest, and
+    get_session must return the original content (marker rehydrated).
+    """
+    proj_dir = tmp_path / "projects" / "myproject"
+    proj_dir.mkdir(parents=True)
+    large = "x" * 150_000
+    records = [
+        {
+            "uuid": "g1",
+            "sessionId": "sess-big",
+            "type": "user",
+            "timestamp": "2026-03-01T12:00:01.000Z",
+            "parentUuid": None,
+            "message": {"role": "user", "content": "intro"},
+        },
+        {
+            "uuid": "g2",
+            "sessionId": "sess-big",
+            "type": "assistant",
+            "timestamp": "2026-03-01T12:00:02.000Z",
+            "parentUuid": "g1",
+            "message": {"role": "assistant", "content": large},
+        },
+    ]
+    (proj_dir / "sess-big.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n"
+    )
+
+    async with run_server(
+        tmp_path, {"INGEST_SESSIONS_BLOBS_DIR": str(tmp_path / "blobs")}
+    ) as (client, _):
+        # Precondition: the stored record holds a marker, not the content.
+        result = await client.call_tool(
+            "query", {"sql": "SELECT raw FROM records WHERE uuid = 'g2'"}
+        )
+        assert "[Large Content:" in _text(result)
+
+        # get_session must rehydrate it back to the original content.
+        result = await client.call_tool("get_session", {"session_id": "sess-big"})
+        payload = json.loads(_text(result))
+        assert payload["record_count"] == 2
+        assert payload["missing_blobs"] == []
+        contents = [r["raw"]["message"]["content"] for r in payload["records"]]
+        assert contents[0] == "intro"
+        assert contents[1] == large
+
+        # format='text' renders a plaintext transcript.
+        result = await client.call_tool(
+            "get_session", {"session_id": "sess-big", "format": "text"}
+        )
+        payload = json.loads(_text(result))
+        assert "intro" in payload["text"]
+        assert large in payload["text"]
+
+
+@pytest.mark.asyncio
 async def test_context_tool_returns_none_without_summaries(tmp_path: Path):
     """Context tool should indicate no summaries when DAG is empty."""
     async with run_server(tmp_path) as (client, _):
