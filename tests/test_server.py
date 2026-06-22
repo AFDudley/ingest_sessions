@@ -566,6 +566,95 @@ async def test_get_session_rehydrates_blob_e2e(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_server_lists_add_supersession_tool(tmp_path: Path):
+    """The server should list 'add_supersession' as an available tool."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.list_tools()
+        assert "add_supersession" in [t.name for t in result.tools]
+
+
+@pytest.mark.asyncio
+async def test_add_supersession_tool_e2e(tmp_path: Path):
+    """add_supersession tool ingests a link; the row lands and is queryable.
+
+    Drives the running server over stdio: call the tool, then query the
+    supersessions table to confirm the row landed, and confirm the
+    superseded record is reflected as superseded via SQL.
+    """
+    async with run_server(tmp_path) as (client, _):
+        # Table starts empty.
+        result = await client.call_tool(
+            "query", {"sql": "SELECT count(*) AS n FROM supersessions"}
+        )
+        assert json.loads(_text(result)) == [{"n": 0}]
+
+        # Ingest a supersession link through the tool.
+        result = await client.call_tool(
+            "add_supersession",
+            {
+                "superseding_id": "rec-new",
+                "superseded_id": "rec-old",
+                "source": "manual",
+            },
+        )
+        body = json.loads(_text(result))
+        assert body == {"inserted": True}
+
+        # The row landed.
+        result = await client.call_tool(
+            "query",
+            {"sql": "SELECT superseding_id, superseded_id, source FROM supersessions"},
+        )
+        rows = json.loads(_text(result))
+        assert rows == [
+            {
+                "superseding_id": "rec-new",
+                "superseded_id": "rec-old",
+                "source": "manual",
+            }
+        ]
+
+        # The superseded record is reflected as superseded.
+        result = await client.call_tool(
+            "query",
+            {
+                "sql": "SELECT count(*) AS n FROM supersessions "
+                "WHERE superseded_id = 'rec-old'"
+            },
+        )
+        assert json.loads(_text(result)) == [{"n": 1}]
+
+        # Re-ingesting the same link is idempotent (inserted=False).
+        result = await client.call_tool(
+            "add_supersession",
+            {
+                "superseding_id": "rec-new",
+                "superseded_id": "rec-old",
+                "source": "manual",
+            },
+        )
+        assert json.loads(_text(result)) == {"inserted": False}
+
+        result = await client.call_tool(
+            "query", {"sql": "SELECT count(*) AS n FROM supersessions"}
+        )
+        assert json.loads(_text(result)) == [{"n": 1}]
+
+
+@pytest.mark.asyncio
+async def test_add_supersession_tool_rejects_self_link(tmp_path: Path):
+    """A self-link returns an error object (ValueError surfaced)."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.call_tool(
+            "add_supersession",
+            {"superseding_id": "same", "superseded_id": "same", "source": "manual"},
+        )
+        body = json.loads(_text(result))
+        assert "error" in body
+        assert isinstance(body["error"], str)
+
+
+@pytest.mark.asyncio
 async def test_context_tool_returns_none_without_summaries(tmp_path: Path):
     """Context tool should indicate no summaries when DAG is empty."""
     async with run_server(tmp_path) as (client, _):
