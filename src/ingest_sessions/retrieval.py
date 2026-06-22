@@ -273,26 +273,38 @@ def retrieve_relevant(
     *,
     k: int = 10,
     candidate_k: int = 40,
+    now_ms: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Stage-2 relevance retrieval: rerank stage-1 candidates by cross-encoder.
+    """Stage-2/3 retrieval: cross-encoder rerank then is-565.3 ranking compose.
 
-    The head of the is-565.2 retrieve pipeline. Pulls a BOUNDED stage-1
-    candidate set via ``retrieve_candidates`` (vector + lexical fused),
-    flattens each candidate to its rerank document text with the same
-    ``embeddings.record_text`` used everywhere, scores them with the ONNX
-    cross-encoder (``rerank.rerank``), attaches ``rerank_score``, and returns
-    the top-``k`` sorted by relevance descending::
+    The head of the retrieve pipeline. Pulls a BOUNDED stage-1 candidate set via
+    ``retrieve_candidates`` (vector + lexical fused), flattens each candidate to
+    its rerank document text with the same ``embeddings.record_text`` used
+    everywhere, scores them with the ONNX cross-encoder (``rerank.rerank``,
+    attaching ``rerank_score``), then composes the is-565.3 ranking signals
+    (recency × confidence × not_superseded × trust-tier) over those scores via
+    ``ranking.rank_candidates`` and returns the top-``k`` sorted by
+    ``final_score`` descending::
 
-        {uuid, session_id, raw, fused_score, rerank_score,
-         vector_distance?, lexical_score?}
+        {uuid, session_id, raw, fused_score, rerank_score, final_score,
+         superseded, recency, tier, vector_distance?, lexical_score?}
+
+    Supersession is read at this boundary via ``supersession.get_superseded_ids``
+    and ``now_ms`` is read here (wall clock) unless injected — the optional
+    ``now_ms`` keeps the MCP/REST callers signature-compatible while letting
+    tests pin the clock for deterministic recency math. The records pipeline only
+    surfaces the PRIMARY tier today, so every candidate is tagged
+    ``tier='primary'`` (the trust-tier floor is implemented + unit-tested in
+    ``ranking``; wiring the summary tier in as a candidate source is a follow-up).
 
     ``uuid`` / ``session_id`` are the integration point — a caller deepens any
     hit via ``get_full_session``. With zero candidates this returns ``[]``
-    without invoking the model. This slice is PURE relevance rerank; the
-    is-565.3 ranking composition (recency / confidence / supersession /
-    trust-tier) is the sibling that joins it here.
+    without invoking the model.
     """
-    from ingest_sessions import embeddings, rerank as rerank_mod
+    import time
+
+    from ingest_sessions import embeddings, ranking, rerank as rerank_mod
+    from ingest_sessions.supersession import get_superseded_ids
 
     candidates = retrieve_candidates(db, query, k=candidate_k)
     if not candidates:
@@ -301,11 +313,16 @@ def retrieve_relevant(
     docs = [embeddings.record_text(c["raw"]) for c in candidates]
     scores = rerank_mod.rerank(query, docs)
 
-    ranked = [
-        {**candidate, "rerank_score": score}
+    scored = [
+        {**candidate, "rerank_score": score, "tier": "primary"}
         for candidate, score in zip(candidates, scores, strict=True)
     ]
-    ranked.sort(key=lambda c: c["rerank_score"], reverse=True)
+
+    superseded_ids = get_superseded_ids(db)
+    clock_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    ranked = ranking.rank_candidates(
+        scored, superseded_ids=superseded_ids, now_ms=clock_ms
+    )
     return ranked[:k]
 
 
