@@ -4,14 +4,20 @@ This module is the on-device retrieval *brain*: the API the MCP server and
 the Claude Code injection hook call to surface prior reasoning. It is kept
 project-AGNOSTIC — no consumer's tracker / ADR semantics live here.
 
-Today it provides the on-demand FETCH primitive (is-565.1):
+It provides the on-demand FETCH primitive (is-565.1) and the lexical arm +
+candidate fusion of the retrieve pipeline (is-565.2b):
 
 ``get_full_session(db, session_id)`` reassembles a complete transcript in
 chronological order, rehydrating every ``[Large Content: file_...]`` marker
 that ingestion offloaded to the blob store (see blobs.py) so a labbook
-``session_id`` citation resolves to the actual content. The retrieve+rerank
-pipeline (is-565.2) and supersession/trust-tier ranking (is-565.3) are the
-siblings that will join it here.
+``session_id`` citation resolves to the actual content.
+
+``search_lexical`` is the BM25 arm (DuckDB ``fts``, no model), the lexical
+counterpart to ``embeddings.search_vector``. ``reciprocal_rank_fusion`` is a
+pure RRF combiner, and ``retrieve_candidates`` fuses the vector + lexical
+arms into the is-565.2 STAGE-1 bounded candidate set (the cross-encoder
+rerank in is-565.2c reranks these). Supersession/trust-tier ranking
+(is-565.3) is the sibling that will join it here.
 
 # See .claude doctrine: functional core, imperative shell — pure helpers
 # (marker parsing, transcript formatting) compute; disk reads happen at the
@@ -147,6 +153,118 @@ def _content_to_text(content: Any) -> str:
                 parts.append(f"[tool_use: {block.get('name', '?')}]")
         return "\n".join(parts)
     return ""
+
+
+def search_lexical(
+    db: duckdb.DuckDBPyConnection, query: str, k: int = 20
+) -> list[dict[str, Any]]:
+    """Return the ``k`` best BM25 matches for *query* (lexical, no model).
+
+    Scores the ``record_fts`` projection with DuckDB's ``match_bm25`` (higher
+    score = better match), joining ``records`` for the parsed ``raw`` payload.
+    Each hit is ``{uuid, session_id, score, raw}``.
+
+    The FTS index is a snapshot built by ``core.rebuild_fts_index``; before it
+    has ever been built the ``fts_main_record_fts`` schema does not exist, so
+    this returns ``[]`` rather than raising — the empty-corpus / no-index case.
+    A query that matches no document also yields ``[]`` (``match_bm25`` returns
+    NULL, filtered out).
+    """
+    index_exists = db.execute(
+        "SELECT 1 FROM information_schema.schemata "
+        "WHERE schema_name = 'fts_main_record_fts'"
+    ).fetchone()
+    if not index_exists:
+        return []
+    rows = db.execute(
+        "SELECT f.uuid, r.session_id, r.raw, "
+        "fts_main_record_fts.match_bm25(f.uuid, ?) AS score "
+        "FROM record_fts f JOIN records r ON f.uuid = r.uuid "
+        "WHERE score IS NOT NULL ORDER BY score DESC LIMIT ?",
+        [query, k],
+    ).fetchall()
+    return [
+        {
+            "uuid": uuid,
+            "session_id": session_id,
+            "score": score,
+            "raw": json.loads(raw),
+        }
+        for uuid, session_id, raw, score in rows
+    ]
+
+
+def reciprocal_rank_fusion(
+    rankings: list[list[str]], *, k_const: int = 60
+) -> list[tuple[str, float]]:
+    """Fuse multiple ranked id-lists into one ranking via RRF (pure).
+
+    Classic Reciprocal Rank Fusion (Cormack et al. 2009): each id's fused
+    score is ``Σ_i 1 / (k_const + rank_i)`` summed over every input list that
+    contains it, where ``rank_i`` is the id's 1-based position in list ``i``.
+    An id ranked highly in several lists thus beats one ranked highly in only
+    one. Returns ``(id, fused_score)`` pairs sorted by score descending; ties
+    break by first appearance across the input lists (stable). Empty input —
+    no lists, or only empty lists — yields ``[]``.
+    """
+    scores: dict[str, float] = {}
+    order: dict[str, int] = {}
+    seq = 0
+    for ranking in rankings:
+        for rank, item in enumerate(ranking, start=1):
+            scores[item] = scores.get(item, 0.0) + 1.0 / (k_const + rank)
+            if item not in order:
+                order[item] = seq
+                seq += 1
+    return sorted(scores.items(), key=lambda kv: (-kv[1], order[kv[0]]))
+
+
+def retrieve_candidates(
+    db: duckdb.DuckDBPyConnection, query: str, k: int = 20
+) -> list[dict[str, Any]]:
+    """Stage-1 candidate retrieval: fuse vector + lexical arms via RRF.
+
+    Runs the vector arm (``embeddings.search_vector``, cosine distance) and the
+    lexical arm (``search_lexical``, BM25), fuses their rank orders with
+    ``reciprocal_rank_fusion``, and returns the top-``k`` fused candidates::
+
+        {uuid, session_id, raw, fused_score,
+         vector_distance?, lexical_score?}
+
+    ``vector_distance`` / ``lexical_score`` are present only for the arm(s)
+    that surfaced the candidate. This is the is-565.2 STAGE-1 output — a
+    BOUNDED candidate set (never "all"), reranked by the cross-encoder in
+    is-565.2c. Each arm contributes up to ``k`` candidates before fusion.
+    """
+    from ingest_sessions.embeddings import search_vector
+
+    vec_hits = search_vector(db, query, k=k)
+    lex_hits = search_lexical(db, query, k=k)
+
+    by_uuid: dict[str, dict[str, Any]] = {}
+    for h in vec_hits:
+        by_uuid[h["uuid"]] = {
+            "uuid": h["uuid"],
+            "session_id": h["session_id"],
+            "raw": h["raw"],
+            "vector_distance": h["distance"],
+        }
+    for h in lex_hits:
+        entry = by_uuid.setdefault(
+            h["uuid"],
+            {"uuid": h["uuid"], "session_id": h["session_id"], "raw": h["raw"]},
+        )
+        entry["lexical_score"] = h["score"]
+
+    fused = reciprocal_rank_fusion(
+        [[h["uuid"] for h in vec_hits], [h["uuid"] for h in lex_hits]]
+    )
+    candidates: list[dict[str, Any]] = []
+    for uuid, score in fused[:k]:
+        entry = dict(by_uuid[uuid])
+        entry["fused_score"] = score
+        candidates.append(entry)
+    return candidates
 
 
 def format_session_text(session: dict[str, Any]) -> str:
