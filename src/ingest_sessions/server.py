@@ -50,6 +50,7 @@ from ingest_sessions.dag import (
 from ingest_sessions.retrieval import (
     format_session_text,
     get_full_session,
+    retrieve_relevant,
 )
 from ingest_sessions.summarize import (
     condense_summaries,
@@ -486,6 +487,38 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="retrieve_relevant",
+            description=(
+                "Retrieve the top-k records most RELEVANT to a query. The "
+                "hook-facing retrieval entry point: fuses on-device vector "
+                "(semantic) + BM25 (lexical) candidate search into a bounded "
+                "shortlist, then reranks it with an ONNX cross-encoder for "
+                "precise relevance. Each result carries its uuid + session_id "
+                "(deepen via get_session) plus rerank_score / fused_score. "
+                "Returns [] when the embedding/FTS indexes have not been built."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The natural-language query to rank against.",
+                    },
+                    "k": {
+                        "type": "integer",
+                        "description": "Number of ranked results to return (default 10).",
+                    },
+                    "candidate_k": {
+                        "type": "integer",
+                        "description": (
+                            "Stage-1 candidate pool size before rerank (default 40)."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
             name="context",
             description=(
                 "Assemble recovery context from the LCM summary DAG "
@@ -585,6 +618,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 )
             )
             return [TextContent(type="text", text=json.dumps(payload, default=str))]
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+    if name == "retrieve_relevant":
+        query = arguments["query"]
+        k = arguments.get("k", 10)
+        candidate_k = arguments.get("candidate_k", 40)
+        try:
+            results = await _db_execute(
+                partial(retrieve_relevant, query=query, k=k, candidate_k=candidate_k)
+            )
+            return [TextContent(type="text", text=json.dumps(results, default=str))]
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
@@ -821,6 +866,29 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
         )
         return starlette.responses.JSONResponse(payload)
 
+    async def handle_retrieve_api(
+        request: starlette.requests.Request,
+    ) -> starlette.responses.JSONResponse:
+        """REST endpoint for relevance retrieval (pebble is-565.2c).
+
+        POST /api/retrieve with {"query": "...", "k"?, "candidate_k"?}.
+        Returns the top-k cross-encoder-reranked records (each with uuid /
+        session_id / rerank_score / fused_score) — the hook-facing retrieval
+        entry point.  Returns [] when the embedding/FTS indexes are empty.
+        """
+        body = await request.json()
+        query = body.get("query", "")
+        if not query:
+            return starlette.responses.JSONResponse(
+                {"error": "query required"}, status_code=400
+            )
+        k = body.get("k", 10)
+        candidate_k = body.get("candidate_k", 40)
+        results = await _db_execute(
+            partial(retrieve_relevant, query=query, k=k, candidate_k=candidate_k)
+        )
+        return starlette.responses.JSONResponse(results)
+
     async def handle_supersessions_api(
         request: starlette.requests.Request,
     ) -> starlette.responses.JSONResponse:
@@ -862,6 +930,7 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             Route("/api/refresh", handle_refresh_api, methods=["POST"]),
             Route("/api/summarize", handle_summarize_api, methods=["POST"]),
             Route("/api/session", handle_session_api, methods=["POST"]),
+            Route("/api/retrieve", handle_retrieve_api, methods=["POST"]),
             Route("/api/supersessions", handle_supersessions_api, methods=["POST"]),
         ],
         lifespan=lifespan,

@@ -655,6 +655,34 @@ async def test_add_supersession_tool_rejects_self_link(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_server_lists_retrieve_relevant_tool(tmp_path: Path):
+    """The server should list 'retrieve_relevant' as an available tool."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.list_tools()
+        assert "retrieve_relevant" in [t.name for t in result.tools]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_relevant_tool_empty_indexes_returns_empty(tmp_path: Path):
+    """retrieve_relevant is callable and returns a well-formed (empty) result.
+
+    The server's startup ingestion does NOT build the embedding/FTS indexes,
+    so with no indexes the tool must return [] gracefully (no crash). Ranking
+    quality is proven in the library-level test where backfill is controlled.
+    """
+    proj_dir = tmp_path / "projects" / "myproject"
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "sess-001.jsonl").write_text(json.dumps(SAMPLE_RECORD) + "\n")
+
+    async with run_server(tmp_path) as (client, _):
+        result = await client.call_tool(
+            "retrieve_relevant", {"query": "anything at all"}
+        )
+        body = json.loads(_text(result))
+        assert body == []
+
+
+@pytest.mark.asyncio
 async def test_context_tool_returns_none_without_summaries(tmp_path: Path):
     """Context tool should indicate no summaries when DAG is empty."""
     async with run_server(tmp_path) as (client, _):
