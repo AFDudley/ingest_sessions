@@ -55,6 +55,10 @@ from ingest_sessions.summarize import (
     condense_summaries,
     summarize_messages,
 )
+from ingest_sessions.supersession import (
+    add_supersession,
+    add_supersessions,
+)
 from ingest_sessions.core import (
     build_session_metadata,
     create_tables,
@@ -499,6 +503,35 @@ async def list_tools() -> list[Tool]:
                 "required": ["session_id"],
             },
         ),
+        Tool(
+            name="add_supersession",
+            description=(
+                "Record that one record supersedes another (newer reasoning "
+                "displacing older), for supersession-aware ranking. 'source' "
+                "is an opaque provenance tag (e.g. 'manual', 'derived', "
+                "'git-revert', 'tracker-close', 'adr-amend'). Idempotent: "
+                'returns {"inserted": true} on a new link, false if it '
+                "already existed. A self-link is rejected."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "superseding_id": {
+                        "type": "string",
+                        "description": "The record uuid that supersedes.",
+                    },
+                    "superseded_id": {
+                        "type": "string",
+                        "description": "The record uuid being superseded.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Opaque provenance tag for the link.",
+                    },
+                },
+                "required": ["superseding_id", "superseded_id", "source"],
+            },
+        ),
     ]
 
 
@@ -562,6 +595,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 partial(assemble_context_for_session, session_id=session_id)
             )
             return [TextContent(type="text", text=json.dumps({"context": ctx}))]
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+    if name == "add_supersession":
+        try:
+            inserted = await _db_execute(
+                partial(
+                    add_supersession,
+                    superseding_id=arguments["superseding_id"],
+                    superseded_id=arguments["superseded_id"],
+                    source=arguments["source"],
+                )
+            )
+            return [TextContent(type="text", text=json.dumps({"inserted": inserted}))]
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
@@ -774,6 +821,36 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
         )
         return starlette.responses.JSONResponse(payload)
 
+    async def handle_supersessions_api(
+        request: starlette.requests.Request,
+    ) -> starlette.responses.JSONResponse:
+        """REST endpoint for supersession-link ingest (pebble is-565.3).
+
+        POST /api/supersessions with either a single link object
+        ``{"superseding_id", "superseded_id", "source"}`` or a batch
+        ``{"links": [{...}, ...]}``.  Returns ``{"inserted": N}`` — the
+        count of newly-inserted rows.  This is the seam consumer-side
+        adapters (git-revert / tracker-close / ADR-amend detectors) feed.
+        """
+        body = await request.json()
+        raw_links = body["links"] if "links" in body else [body]
+        try:
+            links = [
+                (link["superseding_id"], link["superseded_id"], link["source"])
+                for link in raw_links
+            ]
+        except (KeyError, TypeError) as exc:
+            return starlette.responses.JSONResponse(
+                {"error": f"malformed supersession link: {exc}"}, status_code=400
+            )
+        try:
+            inserted = await _db_execute(partial(add_supersessions, links=links))
+        except ValueError as exc:
+            return starlette.responses.JSONResponse(
+                {"error": str(exc)}, status_code=400
+            )
+        return starlette.responses.JSONResponse({"inserted": inserted})
+
     import starlette.requests
     import starlette.responses
     from starlette.routing import Route
@@ -785,6 +862,7 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             Route("/api/refresh", handle_refresh_api, methods=["POST"]),
             Route("/api/summarize", handle_summarize_api, methods=["POST"]),
             Route("/api/session", handle_session_api, methods=["POST"]),
+            Route("/api/supersessions", handle_supersessions_api, methods=["POST"]),
         ],
         lifespan=lifespan,
     )
