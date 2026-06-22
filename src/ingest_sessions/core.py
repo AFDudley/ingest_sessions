@@ -91,6 +91,21 @@ def register_functions(
     """)
 
 
+def load_vss(db: duckdb.DuckDBPyConnection) -> None:
+    """Load the DuckDB ``vss`` extension and enable persistent HNSW indexes.
+
+    ``vss`` provides ``array_cosine_distance`` and the HNSW index used for
+    vector candidate search (see embeddings.py). ``INSTALL`` is idempotent and
+    pulls from the local extension cache after the first network fetch; ``LOAD``
+    is required per connection. The experimental-persistence pragma is needed
+    because the database is on disk — an HNSW index over a file-backed table is
+    gated behind it.
+    """
+    db.execute("INSTALL vss")
+    db.execute("LOAD vss")
+    db.execute("SET hnsw_enable_experimental_persistence = true")
+
+
 def create_tables(db: duckdb.DuckDBPyConnection) -> None:
     """Create the schema and indexes if they don't exist."""
     db.execute("""
@@ -169,6 +184,26 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
             value VARCHAR
         )
     """)
+    # Vector-search sidecar (is-565.2a). Embeddings are a rebuildable
+    # derivative of `records`, kept in a separate table so `records` stays
+    # verbatim. EMBED_DIM lives in embeddings.py (the single source of the
+    # 384-dim contract); importing it here pulls no heavy deps because
+    # fastembed is loaded lazily, not at module import.
+    from ingest_sessions.embeddings import EMBED_DIM
+
+    load_vss(db)
+    db.execute(f"""
+        CREATE TABLE IF NOT EXISTS record_embeddings (
+            uuid VARCHAR PRIMARY KEY,
+            embedding FLOAT[{EMBED_DIM}],
+            embedded_at BIGINT NOT NULL
+        )
+    """)
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_record_embeddings_hnsw "
+        "ON record_embeddings USING HNSW (embedding) WITH (metric = 'cosine')"
+    )
+
     migrate_history_pk(db)
     migrate_capture_v2(db)
     db.execute(
