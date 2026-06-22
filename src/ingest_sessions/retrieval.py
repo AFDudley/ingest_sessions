@@ -267,6 +267,48 @@ def retrieve_candidates(
     return candidates
 
 
+def retrieve_relevant(
+    db: duckdb.DuckDBPyConnection,
+    query: str,
+    *,
+    k: int = 10,
+    candidate_k: int = 40,
+) -> list[dict[str, Any]]:
+    """Stage-2 relevance retrieval: rerank stage-1 candidates by cross-encoder.
+
+    The head of the is-565.2 retrieve pipeline. Pulls a BOUNDED stage-1
+    candidate set via ``retrieve_candidates`` (vector + lexical fused),
+    flattens each candidate to its rerank document text with the same
+    ``embeddings.record_text`` used everywhere, scores them with the ONNX
+    cross-encoder (``rerank.rerank``), attaches ``rerank_score``, and returns
+    the top-``k`` sorted by relevance descending::
+
+        {uuid, session_id, raw, fused_score, rerank_score,
+         vector_distance?, lexical_score?}
+
+    ``uuid`` / ``session_id`` are the integration point — a caller deepens any
+    hit via ``get_full_session``. With zero candidates this returns ``[]``
+    without invoking the model. This slice is PURE relevance rerank; the
+    is-565.3 ranking composition (recency / confidence / supersession /
+    trust-tier) is the sibling that joins it here.
+    """
+    from ingest_sessions import embeddings, rerank as rerank_mod
+
+    candidates = retrieve_candidates(db, query, k=candidate_k)
+    if not candidates:
+        return []
+
+    docs = [embeddings.record_text(c["raw"]) for c in candidates]
+    scores = rerank_mod.rerank(query, docs)
+
+    ranked = [
+        {**candidate, "rerank_score": score}
+        for candidate, score in zip(candidates, scores, strict=True)
+    ]
+    ranked.sort(key=lambda c: c["rerank_score"], reverse=True)
+    return ranked[:k]
+
+
 def format_session_text(session: dict[str, Any]) -> str:
     """Render a get_full_session() result as a human-readable transcript (pure).
 
