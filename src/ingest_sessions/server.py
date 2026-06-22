@@ -47,6 +47,10 @@ from ingest_sessions.dag import (
     insert_bindle,
     insert_sprig,
 )
+from ingest_sessions.retrieval import (
+    format_session_text,
+    get_full_session,
+)
 from ingest_sessions.summarize import (
     condense_summaries,
     summarize_messages,
@@ -151,6 +155,28 @@ def _ingest_file_full(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
     ingest_session_metadata(db, session_id, session_meta)
     record_file(db, jsonl_path, size_bytes=bytes_read)
     return count
+
+
+def _get_session_payload(
+    db: duckdb.DuckDBPyConnection,
+    session_id: str,
+    *,
+    include_blobs: bool,
+    fmt: str,
+) -> dict[str, Any]:
+    """Fetch a full session and shape it for the requested output format.
+
+    fmt="records" (default) returns the structured get_full_session() result;
+    fmt="text" adds a rendered plaintext transcript under "text".
+    """
+    from ingest_sessions.blobs import blob_dir
+
+    session = get_full_session(
+        db, session_id, include_blobs=include_blobs, blob_root=blob_dir()
+    )
+    if fmt == "text":
+        session["text"] = format_session_text(session)
+    return session
 
 
 def _ingest_all(db: duckdb.DuckDBPyConnection) -> None:
@@ -424,6 +450,38 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_session",
+            description=(
+                "Fetch a FULL session by session_id: the complete transcript "
+                "reassembled in chronological order with every "
+                "'[Large Content: file_...]' blob marker rehydrated to its "
+                "original content. This is the on-demand fetch primitive for "
+                "durable session citations (a labbook/ADR session_id resolves "
+                "to actual content). Unlike 'context' (a summary) this returns "
+                "the raw records. Set include_blobs=false to keep compact "
+                "markers; format='text' adds a rendered plaintext transcript."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The session ID to fetch.",
+                    },
+                    "include_blobs": {
+                        "type": "boolean",
+                        "description": "Rehydrate blob markers (default true).",
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["records", "text"],
+                        "description": "Output shape (default 'records').",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
             name="context",
             description=(
                 "Assemble recovery context from the LCM summary DAG "
@@ -479,6 +537,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         session_id = arguments["session_id"]
         result_data = await _run_summarize_async(session_id)
         return [TextContent(type="text", text=json.dumps(result_data))]
+
+    if name == "get_session":
+        session_id = arguments["session_id"]
+        include_blobs = arguments.get("include_blobs", True)
+        fmt = arguments.get("format", "records")
+        try:
+            payload = await _db_execute(
+                partial(
+                    _get_session_payload,
+                    session_id=session_id,
+                    include_blobs=include_blobs,
+                    fmt=fmt,
+                )
+            )
+            return [TextContent(type="text", text=json.dumps(payload, default=str))]
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
     if name == "context":
         session_id = arguments["session_id"]
@@ -672,6 +747,33 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             {"status": "accepted", "session_id": session_id}, status_code=202
         )
 
+    async def handle_session_api(
+        request: starlette.requests.Request,
+    ) -> starlette.responses.JSONResponse:
+        """REST endpoint for full-session fetch (pebble is-565.1).
+
+        POST /api/session with {"session_id": "...", "include_blobs": bool,
+        "format": "records"|"text"}.  Returns the reassembled transcript with
+        blob markers rehydrated.
+        """
+        body = await request.json()
+        session_id = body.get("session_id", "")
+        if not session_id:
+            return starlette.responses.JSONResponse(
+                {"error": "session_id required"}, status_code=400
+            )
+        include_blobs = body.get("include_blobs", True)
+        fmt = body.get("format", "records")
+        payload = await _db_execute(
+            partial(
+                _get_session_payload,
+                session_id=session_id,
+                include_blobs=include_blobs,
+                fmt=fmt,
+            )
+        )
+        return starlette.responses.JSONResponse(payload)
+
     import starlette.requests
     import starlette.responses
     from starlette.routing import Route
@@ -682,6 +784,7 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             Route("/api/context", handle_context_api, methods=["POST"]),
             Route("/api/refresh", handle_refresh_api, methods=["POST"]),
             Route("/api/summarize", handle_summarize_api, methods=["POST"]),
+            Route("/api/session", handle_session_api, methods=["POST"]),
         ],
         lifespan=lifespan,
     )
