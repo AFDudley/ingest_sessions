@@ -5,6 +5,7 @@ description = "MCP server for querying Claude Code session transcripts via DuckD
 requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.0",
+    "fastembed>=0.8.0",
     "mcp>=1.0",
     "starlette>=0.27",
     "uvicorn>=0.20",
@@ -32,3 +33,8 @@ packages = ["src/ingest_sessions"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+]
