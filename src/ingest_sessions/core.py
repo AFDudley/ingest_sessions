@@ -169,6 +169,21 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
             value VARCHAR
         )
     """)
+    # Supersession links (pebble is-565.3): the project-AGNOSTIC substrate
+    # for supersession-aware ranking.  Consumer-side adapters (git-revert,
+    # tracker-close, ADR-amend detectors — all OUTSIDE this repo) feed links
+    # through supersession.add_supersession*; the ranking layer reads them to
+    # down-weight/flag superseded records.  `source` is an opaque provenance
+    # tag this repo never interprets.
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS supersessions (
+            superseding_id VARCHAR NOT NULL,
+            superseded_id  VARCHAR NOT NULL,
+            source         VARCHAR NOT NULL,
+            created_at     BIGINT  NOT NULL,
+            PRIMARY KEY (superseding_id, superseded_id)
+        )
+    """)
     migrate_history_pk(db)
     migrate_capture_v2(db)
     db.execute(
@@ -185,6 +200,11 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
     db.execute("CREATE INDEX IF NOT EXISTS idx_summaries_kind ON summaries(kind)")
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_blob_meta_session_id ON blob_meta(session_id)"
+    )
+    # Index the down-weight lookup direction: "is this record superseded?"
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_supersessions_superseded_id "
+        "ON supersessions(superseded_id)"
     )
 
 
