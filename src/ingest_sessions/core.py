@@ -106,6 +106,46 @@ def load_vss(db: duckdb.DuckDBPyConnection) -> None:
     db.execute("SET hnsw_enable_experimental_persistence = true")
 
 
+def load_fts(db: duckdb.DuckDBPyConnection) -> None:
+    """Load the DuckDB ``fts`` extension (BM25 full-text search).
+
+    Mirrors :func:`load_vss`: ``INSTALL`` is idempotent and pulls from the
+    local extension cache after the first network fetch; ``LOAD`` is required
+    per connection. ``fts`` provides ``PRAGMA create_fts_index`` (which builds
+    a retrievable index over a table and generates a ``fts_main_<table>`` schema
+    exposing a ``match_bm25(id, query)`` macro) — see :func:`rebuild_fts_index`.
+    """
+    db.execute("INSTALL fts")
+    db.execute("LOAD fts")
+
+
+def rebuild_fts_index(db: duckdb.DuckDBPyConnection) -> int:
+    """Rebuild the BM25 full-text index over the records corpus. Returns rows.
+
+    DuckDB's FTS index is a SNAPSHOT — it does not auto-update as ``records``
+    grows — so this is a callable rebuild. ``records.raw`` is JSON, but FTS
+    needs a plain text column, so the index is built over the ``record_fts``
+    projection table (``uuid`` + flattened text). Each call repopulates that
+    projection from ``records`` (reusing :func:`embeddings.record_text`, the
+    same flattener the vector arm embeds, so lexical and vector arms see
+    identical record text) and rebuilds the index with ``overwrite=1``.
+
+    After this call ``fts_main_record_fts.match_bm25(uuid, query)`` is callable
+    (see :func:`retrieval.search_lexical`).
+    """
+    from ingest_sessions.embeddings import record_text
+
+    rows = db.execute("SELECT uuid, raw FROM records").fetchall()
+    db.execute("DELETE FROM record_fts")
+    if rows:
+        db.executemany(
+            "INSERT INTO record_fts VALUES (?, ?)",
+            [(uuid, record_text(json.loads(raw))) for uuid, raw in rows],
+        )
+    db.execute("PRAGMA create_fts_index('record_fts', 'uuid', 'text', overwrite=1)")
+    return len(rows)
+
+
 def create_tables(db: duckdb.DuckDBPyConnection) -> None:
     """Create the schema and indexes if they don't exist."""
     db.execute("""
@@ -203,6 +243,22 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_record_embeddings_hnsw "
         "ON record_embeddings USING HNSW (embedding) WITH (metric = 'cosine')"
     )
+
+    # Lexical-search sidecar (is-565.2b). FTS needs a plain text column, but
+    # `records.raw` is JSON, so `record_fts` is a rebuildable text projection
+    # (uuid + flattened record text) the BM25 index is built over. The index
+    # itself is NOT built here: `create_fts_index` has no IF-NOT-EXISTS, so
+    # building it on every connection would wipe a populated snapshot — it is
+    # built on demand by `rebuild_fts_index`. `search_lexical` guards on the
+    # index not yet existing and returns []. `load_fts` only needs the
+    # extension loaded per connection.
+    load_fts(db)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS record_fts (
+            uuid VARCHAR PRIMARY KEY,
+            text VARCHAR
+        )
+    """)
 
     # Supersession links (pebble is-565.3): the project-AGNOSTIC substrate
     # for supersession-aware ranking.  Consumer-side adapters (git-revert,
