@@ -1176,6 +1176,128 @@ def test_summary_antijoin_finds_unembedded_summary():
     assert [sid for sid, _content in antijoin] == ["sum_b"]
 
 
+# ---------------------------------------------------------------------------
+# FTS rebuild: off-thread + throttle + repair (pebble is-e10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_throttles_fts_rebuild(tmp_path: Path, monkeypatch):
+    """The throttled (periodic) sweep rebuilds FTS at most once per
+    INGEST_SESSIONS_FTS_MIN_INTERVAL, even though it embeds new records every run.
+
+    Drives ``_run_sync_async(throttle_fts=True)`` in-process with an INJECTED
+    clock against a real DB thread + real embedding model. Three runs, each with
+    a fresh unembedded record:
+      * t=0     (first, last=None)        -> rebuild.
+      * t=100   (< 3600 since last)       -> THROTTLED, no rebuild.
+      * t=4000  (>= 3600 since last)      -> rebuild.
+    This is the is-e10 decoupling: embedding stays current every cycle, the
+    costly FTS rebuild is bounded.
+    """
+    import ingest_sessions.server as srv
+
+    monkeypatch.setenv("INGEST_SESSIONS_DB", str(tmp_path / "throttle.duckdb"))
+    monkeypatch.setenv("INGEST_SESSIONS_PROJECTS_DIR", str(tmp_path / "projects"))
+    (tmp_path / "projects").mkdir()
+    monkeypatch.setenv("INGEST_SESSIONS_HISTORY_FILE", str(tmp_path / "history.jsonl"))
+    monkeypatch.setenv("INGEST_SESSIONS_FTS_MIN_INTERVAL", "3600")
+
+    srv._startup_done.clear()
+    srv._backfill_running = False
+    srv._last_fts_rebuild_at = None
+
+    async def _insert(uuid: str, text: str) -> None:
+        raw = json.dumps(_record(uuid, text))
+
+        def _do(db, u=uuid, r=raw) -> None:
+            db.execute(
+                "INSERT INTO records VALUES (?, ?, ?, ?, ?, ?)",
+                [u, "sync-sess", "user", None, None, r],
+            )
+
+        await srv._db_execute(_do)
+
+    thread = srv._start_db_thread()
+    try:
+        await _insert("u-a", "alpha record about database indexing")
+        r1 = await srv._run_sync_async(throttle_fts=True, now=0.0)
+        assert r1["embedded"] == 1
+        assert r1["fts_rebuilt"] is True
+
+        await _insert("u-b", "bravo record about cache eviction")
+        r2 = await srv._run_sync_async(throttle_fts=True, now=100.0)
+        assert r2["embedded"] == 1
+        assert r2["fts_rebuilt"] is False  # THROTTLED: within min_interval
+
+        await _insert("u-c", "charlie record about slow queries")
+        r3 = await srv._run_sync_async(throttle_fts=True, now=4000.0)
+        assert r3["embedded"] == 1
+        assert r3["fts_rebuilt"] is True  # interval elapsed
+    finally:
+        srv._db_queue.put(None)
+        thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_force_fts_repairs_partial_record_fts(tmp_path: Path):
+    """Server e2e: force_fts=true cleanly rebuilds a partial/inconsistent
+    record_fts even when no new records need embedding — the is-e10 repair path.
+
+    Reproduces the broken prod state (record_fts has fewer rows than records,
+    index stale), proves a plain sync does NOT fix it (0 embedded -> no rebuild),
+    then force_fts=true repairs record_fts to records-count and search works —
+    all through the off-thread _rebuild_fts_async (real subprocess server).
+    """
+    _write_session(
+        tmp_path,
+        "sync-sess",
+        [
+            _record("u-900", "How does the gateway settle x402 payments on Solana?"),
+            _record(
+                "u-901",
+                "The gateway caches x402 spend; Solana is the source of truth.",
+                parent="u-900",
+            ),
+        ],
+    )
+
+    async with run_server(tmp_path) as (client, _):
+        body = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert body["fts_rebuilt"] is True
+        assert await _count(client, "record_fts") == 2
+
+        # Simulate the is-e10 partial state: drop a record_fts row WITHOUT
+        # rebuilding the index (table now inconsistent with the index snapshot).
+        await client.call_tool(
+            "query", {"sql": "DELETE FROM record_fts WHERE uuid = 'u-901'"}
+        )
+        assert await _count(client, "record_fts") == 1
+
+        # A plain sync embeds 0 (all already embedded) -> would NOT rebuild.
+        plain = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert plain["embedded"] == 0
+        assert plain["fts_rebuilt"] is False
+        assert await _count(client, "record_fts") == 1  # still broken
+
+        # force_fts=true: a clean rebuild despite 0 embedded -> repaired.
+        repair = json.loads(
+            _text(await client.call_tool("sync", {"wait": True, "force_fts": True}))
+        )
+        assert repair["fts_rebuilt"] is True
+        assert await _count(client, "record_fts") == 2  # repaired to records count
+
+        hits = json.loads(
+            _text(
+                await client.call_tool(
+                    "retrieve_relevant",
+                    {"query": "how are x402 payments settled on Solana"},
+                )
+            )
+        )
+        assert any(h["uuid"] in {"u-900", "u-901"} for h in hits)
+
+
 @pytest.mark.asyncio
 async def test_periodic_sync_eventually_embeds_new_records(tmp_path: Path):
     """The background driver embeds newly-ingested records within one interval.

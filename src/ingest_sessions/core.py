@@ -119,31 +119,80 @@ def load_fts(db: duckdb.DuckDBPyConnection) -> None:
     db.execute("LOAD fts")
 
 
-def rebuild_fts_index(db: duckdb.DuckDBPyConnection) -> int:
-    """Rebuild the BM25 full-text index over the records corpus. Returns rows.
+def fetch_record_raws(db: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
+    """All ``(uuid, raw)`` rows from ``records`` — the DB-thread fetch step.
 
-    DuckDB's FTS index is a SNAPSHOT — it does not auto-update as ``records``
-    grows — so this is a callable rebuild. ``records.raw`` is JSON, but FTS
-    needs a plain text column, so the index is built over the ``record_fts``
-    projection table (``uuid`` + flattened text). Each call repopulates that
-    projection from ``records`` (reusing :func:`embeddings.record_text`, the
-    same flattener the vector arm embeds, so lexical and vector arms see
-    identical record text) and rebuilds the index with ``overwrite=1``.
+    The cheap half of an FTS rebuild: a single scan that must run on the DB
+    thread (DuckDB forbids a second in-process connection). The expensive half
+    — parsing each ``raw`` JSON and flattening it — is :func:`project_record_texts`,
+    which is pure and runs OFF the DB thread (see ``server._rebuild_fts_async``,
+    pebble is-e10).
+    """
+    return db.execute("SELECT uuid, raw FROM records").fetchall()
 
-    After this call ``fts_main_record_fts.match_bm25(uuid, query)`` is callable
-    (see :func:`retrieval.search_lexical`).
+
+def project_record_texts(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Project ``(uuid, raw_json)`` rows to ``(uuid, flattened_text)`` (pure).
+
+    The expensive, CPU-bound half of an FTS rebuild: ``json.loads`` + the
+    :func:`embeddings.record_text` flattener over the whole corpus. It is a pure
+    data-in/data-out transform (no DB, no IO), factored out of the old monolithic
+    ``rebuild_fts_index`` precisely so the server can run it OFF the single DB
+    thread via ``asyncio.to_thread`` — at ~873k rows this loop took ~45 minutes
+    and, when it ran on the DB thread, blocked every query for that whole window
+    (pebble is-e10). Reuses the same flattener the vector arm embeds with, so the
+    lexical and vector arms see identical record text.
     """
     from ingest_sessions.embeddings import record_text
 
-    rows = db.execute("SELECT uuid, raw FROM records").fetchall()
-    db.execute("DELETE FROM record_fts")
-    if rows:
-        db.executemany(
-            "INSERT INTO record_fts VALUES (?, ?)",
-            [(uuid, record_text(json.loads(raw))) for uuid, raw in rows],
-        )
-    db.execute("PRAGMA create_fts_index('record_fts', 'uuid', 'text', overwrite=1)")
-    return len(rows)
+    return [(uuid, record_text(json.loads(raw))) for uuid, raw in rows]
+
+
+def write_fts_index(
+    db: duckdb.DuckDBPyConnection, projection: list[tuple[str, str]]
+) -> int:
+    """Replace ``record_fts`` with *projection* and rebuild the BM25 index. Atomic.
+
+    DuckDB's FTS index is a SNAPSHOT (no incremental update), so ``record_fts``
+    (the ``uuid`` + flattened-text projection FTS is built over) and the
+    ``fts_main_record_fts`` index must be refreshed together. The DELETE +
+    INSERT + ``PRAGMA create_fts_index(overwrite=1)`` run inside a SINGLE
+    transaction, so a process death before COMMIT rolls back to the prior
+    consistent ``(record_fts, index)`` state — atomicity by construction
+    (DuckDB ACID; verified: a rollback after ``create_fts_index`` reverts both
+    the table and the index). This is the atomicity fix for is-e10: the old
+    rebuild deleted + re-inserted without a transaction, so an interrupt could
+    leave ``record_fts`` partial against a stale full-corpus index snapshot.
+
+    *projection* is produced off the DB thread by :func:`project_record_texts`.
+    After this call ``fts_main_record_fts.match_bm25(uuid, query)`` is callable
+    (see :func:`retrieval.search_lexical`). Returns the row count.
+    """
+    db.execute("BEGIN TRANSACTION")
+    try:
+        db.execute("DELETE FROM record_fts")
+        if projection:
+            db.executemany("INSERT INTO record_fts VALUES (?, ?)", projection)
+        db.execute("PRAGMA create_fts_index('record_fts', 'uuid', 'text', overwrite=1)")
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return len(projection)
+
+
+def rebuild_fts_index(db: duckdb.DuckDBPyConnection) -> int:
+    """Rebuild the BM25 full-text index over the records corpus. Returns rows.
+
+    Single-DB-thread composition of the three rebuild phases (fetch → project →
+    atomic write). The server splits these to move the expensive ``project``
+    phase off the DB thread (``server._rebuild_fts_async``); this synchronous
+    helper keeps the simple one-call path for the batch CLI and tests. The write
+    is atomic (see :func:`write_fts_index`).
+    """
+    rows = fetch_record_raws(db)
+    projection = project_record_texts(rows)
+    return write_fts_index(db, projection)
 
 
 def create_tables(db: duckdb.DuckDBPyConnection) -> None:
