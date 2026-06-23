@@ -244,6 +244,25 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
         "ON record_embeddings USING HNSW (embedding) WITH (metric = 'cosine')"
     )
 
+    # Summary-tier vector sidecar (is-565.4). Mirrors `record_embeddings`: the
+    # `summaries` auto-summary tier (sprigs/bindles) is verbatim and the
+    # embeddings are a rebuildable derivative kept in a separate table, so a
+    # summary's content is never mutated. This makes the summary tier a real
+    # vector-search candidate source so the trust-tier floor in `ranking`
+    # (a derived summary cannot outrank a primary record of equal raw
+    # relevance) is exercised end-to-end, not just in synthetic unit tests.
+    db.execute(f"""
+        CREATE TABLE IF NOT EXISTS summary_embeddings (
+            summary_id VARCHAR PRIMARY KEY,
+            embedding FLOAT[{EMBED_DIM}],
+            embedded_at BIGINT NOT NULL
+        )
+    """)
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_summary_embeddings_hnsw "
+        "ON summary_embeddings USING HNSW (embedding) WITH (metric = 'cosine')"
+    )
+
     # Lexical-search sidecar (is-565.2b). FTS needs a plain text column, but
     # `records.raw` is JSON, so `record_fts` is a rebuildable text projection
     # (uuid + flattened record text) the BM25 index is built over. The index

@@ -21,15 +21,15 @@ Design (see .claude doctrine: functional core, imperative shell):
     ``superseded_ids``, keeping this module free of IO.
   * ``default_confidence`` is a small, swappable, honest heuristic.
 
-SEAM NOTE (trust-tier is implemented + unit-tested, not yet end-to-end): the
-live ``retrieval.retrieve_relevant`` pipeline only indexes the primary
-``records`` tier today — the ``summaries`` auto-summary tier (sprigs/bindles) is
-not yet a retrieval candidate source. So the trust-tier floor (a summary never
-outranks a contradicting primary record of equal raw relevance) is exercised by
-unit tests with synthetic mixed-tier candidates, NOT yet end-to-end. Wiring the
-summary tier INTO retrieval is a follow-up (is-565.2 territory) — deliberately
-out of scope here. The supersession + recency + confidence factors ARE wired
-end-to-end via ``retrieve_relevant``.
+TRUST-TIER IS NOW WIRED END-TO-END (is-565.4): the live
+``retrieval.retrieve_relevant`` pipeline indexes BOTH the primary ``records``
+tier and the ``summaries`` auto-summary tier (sprigs/bindles) — summaries are a
+real vector-search candidate source (``embeddings.search_summaries``, embedded
+by the server sync sweep), tagged ``tier='summary'`` and carried through to
+``rank_candidates`` here. So the trust-tier floor (a summary never outranks a
+primary record of equal raw relevance) is exercised END-TO-END with real
+models, not only by synthetic unit tests. The supersession + recency +
+confidence factors are likewise wired end-to-end via ``retrieve_relevant``.
 """
 
 from __future__ import annotations
