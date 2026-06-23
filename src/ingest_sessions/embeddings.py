@@ -125,6 +125,91 @@ def backfill_embeddings(
     return total
 
 
+def summary_text(row: dict[str, Any]) -> str:
+    """Flatten a summary row to embeddable text (pure, is-565.4).
+
+    Summary ``content`` is already plain narrative prose (produced by the
+    summarize DAG), so the embeddable text IS the content. The ``kind``
+    (sprig/bindle) is structural metadata, not query-relevant signal, so it is
+    deliberately NOT prefixed — a "sprig:" / "bindle:" token would only dilute
+    the semantic match against a natural-language query. Returns ``""`` for a
+    row without usable content.
+    """
+    content = row.get("content")
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def backfill_summary_embeddings(
+    db: duckdb.DuckDBPyConnection,
+    *,
+    batch_size: int = 256,
+    limit: int | None = None,
+) -> int:
+    """Embed summaries lacking a ``summary_embeddings`` row. Returns count added.
+
+    The summary-tier analogue of :func:`backfill_embeddings`. Resumable and
+    incremental via an anti-join (``summaries LEFT JOIN summary_embeddings WHERE
+    NULL``): a second call over an unchanged corpus embeds 0, and a summary the
+    DAG creates later is picked up on the next call. ``limit`` caps records
+    considered; ``batch_size`` bounds texts per model call.
+    """
+    sql = (
+        "SELECT s.summary_id, s.content FROM summaries s "
+        "LEFT JOIN summary_embeddings e ON s.summary_id = e.summary_id "
+        "WHERE e.summary_id IS NULL ORDER BY s.summary_id"
+    )
+    if limit is not None:
+        sql += f" LIMIT {int(limit)}"
+    rows = db.execute(sql).fetchall()
+
+    total = 0
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start : start + batch_size]
+        texts = [summary_text({"content": content}) for _sid, content in batch]
+        vectors = embed_texts(texts)
+        now_ms = int(time.time() * 1000)
+        db.executemany(
+            "INSERT OR IGNORE INTO summary_embeddings VALUES (?, ?, ?)",
+            [
+                (sid, vector, now_ms)
+                for (sid, _content), vector in zip(batch, vectors, strict=True)
+            ],
+        )
+        total += len(batch)
+    return total
+
+
+def search_summaries(
+    db: duckdb.DuckDBPyConnection, query: str, k: int = 20
+) -> list[dict[str, Any]]:
+    """Return the ``k`` nearest summaries to *query* by cosine distance (is-565.4).
+
+    The summary-tier analogue of :func:`search_vector`. Embeds the query and
+    ranks ``summary_embeddings`` by ``array_cosine_distance`` (lower = more
+    similar), joining ``summaries`` for the verbatim content. Each hit is
+    ``{summary_id, session_id, content, distance}``.
+    """
+    qvec = embed_query(query)
+    rows = db.execute(
+        "SELECT s.summary_id, s.session_id, s.content, "
+        f"array_cosine_distance(e.embedding, ?::FLOAT[{EMBED_DIM}]) AS distance "
+        "FROM summary_embeddings e JOIN summaries s USING (summary_id) "
+        "ORDER BY distance LIMIT ?",
+        [qvec, k],
+    ).fetchall()
+    return [
+        {
+            "summary_id": summary_id,
+            "session_id": session_id,
+            "content": content,
+            "distance": distance,
+        }
+        for summary_id, session_id, content, distance in rows
+    ]
+
+
 def search_vector(
     db: duckdb.DuckDBPyConnection, query: str, k: int = 20
 ) -> list[dict[str, Any]]:

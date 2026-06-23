@@ -219,49 +219,102 @@ def reciprocal_rank_fusion(
     return sorted(scores.items(), key=lambda kv: (-kv[1], order[kv[0]]))
 
 
+def _candidate_doc(candidate: dict[str, Any]) -> str:
+    """Flatten a candidate to its rerank document text (pure, is-565.4).
+
+    A PRIMARY (record) candidate carries parsed ``raw`` JSON, flattened by the
+    same ``embeddings.record_text`` the vector/lexical arms embed. A SUMMARY
+    candidate carries verbatim ``content`` prose (no ``raw``) — its content IS
+    the document. This keeps the cross-encoder seeing the same text each tier
+    was indexed on, for both tiers.
+    """
+    from ingest_sessions.embeddings import record_text
+
+    raw = candidate.get("raw")
+    if isinstance(raw, dict):
+        return record_text(raw)
+    content = candidate.get("content")
+    return content if isinstance(content, str) else ""
+
+
 def retrieve_candidates(
     db: duckdb.DuckDBPyConnection, query: str, k: int = 20
 ) -> list[dict[str, Any]]:
-    """Stage-1 candidate retrieval: fuse vector + lexical arms via RRF.
+    """Stage-1 candidate retrieval: fuse record + summary arms via RRF.
 
-    Runs the vector arm (``embeddings.search_vector``, cosine distance) and the
-    lexical arm (``search_lexical``, BM25), fuses their rank orders with
-    ``reciprocal_rank_fusion``, and returns the top-``k`` fused candidates::
+    Runs three retrieval arms and fuses their rank orders with
+    ``reciprocal_rank_fusion``:
 
-        {uuid, session_id, raw, fused_score,
+      * record vector arm (``embeddings.search_vector``, cosine distance),
+      * record lexical arm (``search_lexical``, BM25),
+      * summary vector arm (``embeddings.search_summaries``, cosine distance over
+        the ``summaries`` auto-tier — is-565.4).
+
+    Returns the top-``k`` fused candidates, each tagged with its trust ``tier``::
+
+        # PRIMARY (record) candidate
+        {uuid, session_id, raw, tier="primary", fused_score,
          vector_distance?, lexical_score?}
+        # SUMMARY candidate
+        {uuid (= summary_id), summary_id, session_id, content,
+         tier="summary", fused_score, summary_distance}
 
-    ``vector_distance`` / ``lexical_score`` are present only for the arm(s)
-    that surfaced the candidate. This is the is-565.2 STAGE-1 output — a
-    BOUNDED candidate set (never "all"), reranked by the cross-encoder in
-    is-565.2c. Each arm contributes up to ``k`` candidates before fusion.
+    Summary candidates carry a stable ``uuid`` (their ``summary_id``) so the
+    downstream ``ranking.rank_candidates`` — which keys off ``uuid`` — handles
+    both tiers uniformly. The ``tier`` tag is what makes the trust-tier floor
+    (a summary cannot outrank a primary record of equal raw relevance) fire
+    end-to-end. ``vector_distance`` / ``lexical_score`` / ``summary_distance``
+    are present only for the arm(s) that surfaced the candidate. This is the
+    is-565.2 STAGE-1 output — a BOUNDED candidate set (never "all"), reranked by
+    the cross-encoder in is-565.2c. Each arm contributes up to ``k`` candidates
+    before fusion.
     """
-    from ingest_sessions.embeddings import search_vector
+    from ingest_sessions.embeddings import search_summaries, search_vector
 
     vec_hits = search_vector(db, query, k=k)
     lex_hits = search_lexical(db, query, k=k)
+    sum_hits = search_summaries(db, query, k=k)
 
-    by_uuid: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
     for h in vec_hits:
-        by_uuid[h["uuid"]] = {
+        by_id[h["uuid"]] = {
             "uuid": h["uuid"],
             "session_id": h["session_id"],
             "raw": h["raw"],
+            "tier": "primary",
             "vector_distance": h["distance"],
         }
     for h in lex_hits:
-        entry = by_uuid.setdefault(
+        entry = by_id.setdefault(
             h["uuid"],
-            {"uuid": h["uuid"], "session_id": h["session_id"], "raw": h["raw"]},
+            {
+                "uuid": h["uuid"],
+                "session_id": h["session_id"],
+                "raw": h["raw"],
+                "tier": "primary",
+            },
         )
         entry["lexical_score"] = h["score"]
+    for h in sum_hits:
+        by_id[h["summary_id"]] = {
+            "uuid": h["summary_id"],
+            "summary_id": h["summary_id"],
+            "session_id": h["session_id"],
+            "content": h["content"],
+            "tier": "summary",
+            "summary_distance": h["distance"],
+        }
 
     fused = reciprocal_rank_fusion(
-        [[h["uuid"] for h in vec_hits], [h["uuid"] for h in lex_hits]]
+        [
+            [h["uuid"] for h in vec_hits],
+            [h["uuid"] for h in lex_hits],
+            [h["summary_id"] for h in sum_hits],
+        ]
     )
     candidates: list[dict[str, Any]] = []
-    for uuid, score in fused[:k]:
-        entry = dict(by_uuid[uuid])
+    for cand_id, score in fused[:k]:
+        entry = dict(by_id[cand_id])
         entry["fused_score"] = score
         candidates.append(entry)
     return candidates
@@ -286,8 +339,12 @@ def retrieve_relevant(
     ``ranking.rank_candidates`` and returns the top-``k`` sorted by
     ``final_score`` descending::
 
+        # PRIMARY (record) hit
         {uuid, session_id, raw, fused_score, rerank_score, final_score,
-         superseded, recency, tier, vector_distance?, lexical_score?}
+         superseded, recency, tier="primary", vector_distance?, lexical_score?}
+        # SUMMARY hit
+        {uuid (= summary_id), summary_id, session_id, content, fused_score,
+         rerank_score, final_score, superseded, recency, tier="summary"}
 
     Supersession is read at this boundary via
     ``supersession.get_superseded_ids`` (record-level) AND
@@ -296,18 +353,21 @@ def retrieve_relevant(
     a superseded_id), and ``now_ms`` is read here (wall clock) unless injected
     — the optional
     ``now_ms`` keeps the MCP/REST callers signature-compatible while letting
-    tests pin the clock for deterministic recency math. The records pipeline only
-    surfaces the PRIMARY tier today, so every candidate is tagged
-    ``tier='primary'`` (the trust-tier floor is implemented + unit-tested in
-    ``ranking``; wiring the summary tier in as a candidate source is a follow-up).
+    tests pin the clock for deterministic recency math. Candidates now come from
+    BOTH the primary ``records`` tier and the ``summaries`` auto-tier (is-565.4):
+    each candidate's own ``tier`` (set by ``retrieve_candidates``) is carried
+    through to ``ranking.rank_candidates``, so the trust-tier floor (a summary
+    cannot outrank a primary record of equal raw relevance) fires END-TO-END,
+    not just in synthetic unit tests.
 
-    ``uuid`` / ``session_id`` are the integration point — a caller deepens any
-    hit via ``get_full_session``. With zero candidates this returns ``[]``
+    ``uuid`` / ``session_id`` are the integration point — a caller deepens a
+    record hit via ``get_full_session`` and traces a summary hit via its
+    ``summary_id`` / ``content``. With zero candidates this returns ``[]``
     without invoking the model.
     """
     import time
 
-    from ingest_sessions import embeddings, ranking, rerank as rerank_mod
+    from ingest_sessions import ranking, rerank as rerank_mod
     from ingest_sessions.supersession import (
         get_superseded_ids,
         get_superseded_session_ids,
@@ -317,11 +377,11 @@ def retrieve_relevant(
     if not candidates:
         return []
 
-    docs = [embeddings.record_text(c["raw"]) for c in candidates]
+    docs = [_candidate_doc(c) for c in candidates]
     scores = rerank_mod.rerank(query, docs)
 
     scored = [
-        {**candidate, "rerank_score": score, "tier": "primary"}
+        {**candidate, "rerank_score": score}
         for candidate, score in zip(candidates, scores, strict=True)
     ]
 

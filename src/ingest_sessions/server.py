@@ -73,7 +73,7 @@ from ingest_sessions.core import (
     record_file,
     register_functions,
 )
-from ingest_sessions.embeddings import embed_texts, record_text
+from ingest_sessions.embeddings import embed_texts, record_text, summary_text
 
 T = TypeVar("T")
 
@@ -441,16 +441,75 @@ def _fetch_unembedded_antijoin(
     ).fetchall()
 
 
+def _fetch_unembedded_summaries_antijoin(
+    db: duckdb.DuckDBPyConnection, *, limit: int
+) -> list[tuple[str, str]]:
+    """Next batch of (summary_id, content) for summaries lacking an embedding.
+
+    The summary-tier counterpart of ``_fetch_unembedded_antijoin`` (is-565.4).
+    Summaries are produced by the summarize DAG over time, so the same sweep
+    that keeps ``record_embeddings`` current also keeps ``summary_embeddings``
+    current — the summary trust-tier becomes a retrieval candidate source
+    eventually-consistently, within one sweep interval of a summary's creation.
+    """
+    return db.execute(
+        "SELECT s.summary_id, s.content FROM summaries s "
+        "LEFT JOIN summary_embeddings e ON s.summary_id = e.summary_id "
+        "WHERE e.summary_id IS NULL LIMIT ?",
+        [limit],
+    ).fetchall()
+
+
+def _insert_summary_embeddings_batch(
+    db: duckdb.DuckDBPyConnection, *, rows: list[tuple[str, list[float], int]]
+) -> None:
+    """Insert a batch of (summary_id, embedding, embedded_at). Idempotent."""
+    db.executemany("INSERT OR IGNORE INTO summary_embeddings VALUES (?, ?, ?)", rows)
+
+
+async def _sync_summary_embeddings(batch_size: int) -> int:
+    """Embed every summary missing an embedding (anti-join). Returns count.
+
+    Mirrors the record sweep: fetch unembedded summaries via anti-join, embed
+    OFF the DB thread (``asyncio.to_thread`` — onnxruntime releases the GIL),
+    write the embeddings back through the single DB thread. Summaries have NO
+    FTS arm (the BM25 index is records-only); they are a vector-search tier, so
+    no index rebuild is needed here.
+    """
+    embedded = 0
+    while True:
+        rows = await _db_execute(
+            partial(_fetch_unembedded_summaries_antijoin, limit=batch_size)
+        )
+        if not rows:
+            break
+        texts = [summary_text({"content": content}) for _sid, content in rows]
+        vectors = await asyncio.to_thread(embed_texts, texts)
+        now_ms = int(time.time() * 1000)
+        params = [
+            (sid, vector, now_ms)
+            for (sid, _content), vector in zip(rows, vectors, strict=True)
+        ]
+        await _db_execute(partial(_insert_summary_embeddings_batch, rows=params))
+        embedded += len(rows)
+        await asyncio.sleep(0)
+    return embedded
+
+
 async def _run_sync_async(*, batch_size: int = 256) -> dict[str, int | bool | str]:
-    """Embed every record missing an embedding (anti-join), rebuild FTS if any.
+    """Embed every record + summary missing an embedding, rebuild FTS if any.
 
-    Returns ``{"embedded": N, "fts_rebuilt": bool}`` on completion, or
-    ``{"status": "already_running"}`` if a backfill/sync is already in flight
-    (shares the bulk backfill's guard — only one embedding writer at a time).
+    Returns ``{"embedded": N, "summaries_embedded": M, "fts_rebuilt": bool}`` on
+    completion, or ``{"status": "already_running"}`` if a backfill/sync is
+    already in flight (shares the bulk backfill's guard — only one embedding
+    writer at a time).
 
-    The FTS index is rebuilt once at the end iff this run embedded > 0 rows
-    (the only way `records` content changed relative to the index). The HNSW
-    vector index stays in place (incremental inserts) so search keeps working.
+    One sweep keeps BOTH the ``record_embeddings`` and ``summary_embeddings``
+    sidecars in sync with their source tables (is-565.4): records via the
+    anti-join below, summaries via ``_sync_summary_embeddings``. The FTS index
+    is rebuilt once at the end iff this run embedded > 0 RECORD rows (the only
+    way the records FTS corpus changed; summaries have no FTS arm). The HNSW
+    vector indexes stay in place (incremental inserts) so search keeps working.
     """
     global _backfill_running
     if _backfill_running:
@@ -477,11 +536,17 @@ async def _run_sync_async(*, batch_size: int = 256) -> dict[str, int | bool | st
             # Yield so other requests interleave between batches.
             await asyncio.sleep(0)
 
+        summaries_embedded = await _sync_summary_embeddings(batch_size)
+
         fts_rebuilt = False
         if embedded > 0:
             await _db_execute(lambda db: rebuild_fts_index(db))
             fts_rebuilt = True
-        return {"embedded": embedded, "fts_rebuilt": fts_rebuilt}
+        return {
+            "embedded": embedded,
+            "summaries_embedded": summaries_embedded,
+            "fts_rebuilt": fts_rebuilt,
+        }
     finally:
         _backfill_running = False
 

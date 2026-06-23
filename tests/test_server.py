@@ -1079,6 +1079,104 @@ async def test_sync_is_idempotent(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_sync_embeds_summaries_and_surfaces_summary_tier(tmp_path: Path):
+    """Server e2e (is-565.4): the sync sweep embeds the summaries auto-tier too,
+    and retrieve_relevant then surfaces the summary tagged tier='summary'.
+
+    Seed a record corpus, insert a SUMMARY row through the query tool (the
+    summarize DAG normally produces these via the LLM — inserting directly keeps
+    the test model-free for the summary content while still exercising the real
+    embedding sweep), then sync (wait=true). Assert the sweep reports
+    summaries_embedded, summary_embeddings is populated, and retrieve_relevant
+    returns a tier='summary' hit — the summary tier is a real candidate source
+    end-to-end.
+    """
+    _write_session(
+        tmp_path,
+        "sync-sess",
+        [_record("u-900", "How does the gateway settle x402 payments on Solana?")],
+    )
+
+    async with run_server(tmp_path) as (client, _):
+        # Insert a summary directly (no LLM): it summarizes the same topic.
+        insert_sql = (
+            "INSERT INTO summaries VALUES ("
+            "'sum_x402', 'sync-sess', 'sprig', 1, "
+            "'Summary: the gateway caches x402 spend while the Solana chain "
+            "remains the source of truth for settlement.', "
+            "40, [], [], [], 0)"
+        )
+        await client.call_tool("query", {"sql": insert_sql})
+        assert await _count(client, "summaries") == 1
+
+        body = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert body["embedded"] == 1  # the one record
+        assert body["summaries_embedded"] == 1  # the one summary
+        assert body["fts_rebuilt"] is True
+
+        assert await _count(client, "summary_embeddings") == 1
+
+        hits = json.loads(
+            _text(
+                await client.call_tool(
+                    "retrieve_relevant",
+                    {"query": "how are x402 payments settled on Solana"},
+                )
+            )
+        )
+        assert hits, "expected retrieval hits"
+        summary_hits = [h for h in hits if h["tier"] == "summary"]
+        assert summary_hits, (
+            f"summary tier must surface; tiers={[h['tier'] for h in hits]}"
+        )
+        assert summary_hits[0]["summary_id"] == "sum_x402"
+
+
+@pytest.mark.asyncio
+async def test_sync_summaries_is_idempotent(tmp_path: Path):
+    """A second sync embeds 0 new summaries over an unchanged summary corpus."""
+    _write_session(tmp_path, "sync-sess", [_record("u-900", "a record")])
+
+    async with run_server(tmp_path) as (client, _):
+        await client.call_tool(
+            "query",
+            {
+                "sql": (
+                    "INSERT INTO summaries VALUES ("
+                    "'sum_a', 'sync-sess', 'sprig', 1, 'some summary content', "
+                    "20, [], [], [], 0)"
+                )
+            },
+        )
+        first = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert first["summaries_embedded"] == 1
+
+        second = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert second["summaries_embedded"] == 0
+
+
+def test_summary_antijoin_finds_unembedded_summary():
+    """Unit proof (no model): the summary anti-join returns only summaries that
+    lack an embedding, mirroring the record anti-join."""
+    import duckdb
+
+    import ingest_sessions.server as srv
+    from ingest_sessions.core import create_tables
+
+    db = duckdb.connect(":memory:")
+    create_tables(db)
+    db.execute(
+        "INSERT INTO summaries VALUES "
+        "('sum_a', 's', 'sprig', 1, 'embedded summary', 10, [], [], [], 0),"
+        "('sum_b', 's', 'sprig', 1, 'unembedded summary', 10, [], [], [], 0)"
+    )
+    db.execute("INSERT INTO summary_embeddings VALUES ('sum_a', ?, 0)", [[0.0] * 384])
+
+    antijoin = srv._fetch_unembedded_summaries_antijoin(db, limit=256)
+    assert [sid for sid, _content in antijoin] == ["sum_b"]
+
+
+@pytest.mark.asyncio
 async def test_periodic_sync_eventually_embeds_new_records(tmp_path: Path):
     """The background driver embeds newly-ingested records within one interval.
 
