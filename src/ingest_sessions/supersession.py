@@ -109,6 +109,29 @@ def get_superseded_ids(db: duckdb.DuckDBPyConnection) -> set[str]:
     return {row[0] for row in rows}
 
 
+def get_superseded_session_ids(db: duckdb.DuckDBPyConnection) -> set[str]:
+    """Return the superseded ids that name a SESSION rather than a record.
+
+    Supersession links are stored in one opaque-id table; a link is
+    *session-grained* when its ``superseded_id`` matches a known
+    ``records.session_id``. Record-id vs session-id is resolved by LOOKUP
+    against the corpus (a join), NOT by a schema flag — so the same dumb
+    ``(superseding_id, superseded_id, source)`` row carries either grain and
+    the grain is determined by what the id actually refers to. (A session id
+    and a record uuid never collide: a record uuid is the per-message
+    ``uuid`` PRIMARY KEY, a session id is the per-transcript ``session_id``.)
+
+    This returns the DISTINCT set of superseded *session* ids — the bulk
+    down-weight input the ranking layer uses to flag EVERY record of a
+    superseded session, even records whose own uuid is not directly listed.
+    """
+    rows = db.execute(
+        "SELECT DISTINCT s.superseded_id FROM supersessions s "
+        "WHERE s.superseded_id IN (SELECT DISTINCT session_id FROM records)"
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
 def get_supersessions_for(
     db: duckdb.DuckDBPyConnection,
     record_id: str,

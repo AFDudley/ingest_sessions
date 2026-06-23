@@ -289,8 +289,12 @@ def retrieve_relevant(
         {uuid, session_id, raw, fused_score, rerank_score, final_score,
          superseded, recency, tier, vector_distance?, lexical_score?}
 
-    Supersession is read at this boundary via ``supersession.get_superseded_ids``
-    and ``now_ms`` is read here (wall clock) unless injected — the optional
+    Supersession is read at this boundary via
+    ``supersession.get_superseded_ids`` (record-level) AND
+    ``supersession.get_superseded_session_ids`` (session-level — so a record
+    whose whole SESSION was superseded is flagged even when its own uuid is not
+    a superseded_id), and ``now_ms`` is read here (wall clock) unless injected
+    — the optional
     ``now_ms`` keeps the MCP/REST callers signature-compatible while letting
     tests pin the clock for deterministic recency math. The records pipeline only
     surfaces the PRIMARY tier today, so every candidate is tagged
@@ -304,7 +308,10 @@ def retrieve_relevant(
     import time
 
     from ingest_sessions import embeddings, ranking, rerank as rerank_mod
-    from ingest_sessions.supersession import get_superseded_ids
+    from ingest_sessions.supersession import (
+        get_superseded_ids,
+        get_superseded_session_ids,
+    )
 
     candidates = retrieve_candidates(db, query, k=candidate_k)
     if not candidates:
@@ -319,9 +326,13 @@ def retrieve_relevant(
     ]
 
     superseded_ids = get_superseded_ids(db)
+    superseded_session_ids = get_superseded_session_ids(db)
     clock_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     ranked = ranking.rank_candidates(
-        scored, superseded_ids=superseded_ids, now_ms=clock_ms
+        scored,
+        superseded_ids=superseded_ids,
+        superseded_session_ids=superseded_session_ids,
+        now_ms=clock_ms,
     )
     return ranked[:k]
 

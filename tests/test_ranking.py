@@ -198,6 +198,50 @@ def test_rank_candidates_superseded_flagged_and_demoted() -> None:
     assert new_hit["superseded"] is False
 
 
+def test_rank_candidates_session_level_supersession_flags_all_records() -> None:
+    # is-565.6: a record whose SESSION is superseded gets the superseded
+    # down-weight + flag even though its OWN uuid is not in superseded_ids.
+    # 'r1'/'r2' belong to the superseded session 's-old'; 'r3' belongs to a
+    # live session 's-new'. r1 has the highest raw relevance but must fall.
+    cands = [
+        _candidate("r1", 5.0, session_id="s-old"),
+        _candidate("r2", 3.0, session_id="s-old"),
+        _candidate("r3", 1.0, session_id="s-new"),
+    ]
+    ranked = rank_candidates(
+        cands,
+        superseded_ids=set(),
+        superseded_session_ids={"s-old"},
+        now_ms=NOW_MS,
+    )
+    by_uuid = {c["uuid"]: c for c in ranked}
+    assert by_uuid["r1"]["superseded"] is True
+    assert by_uuid["r2"]["superseded"] is True
+    assert by_uuid["r3"]["superseded"] is False
+    # the live record outranks both superseded ones despite lower raw relevance.
+    assert ranked[0]["uuid"] == "r3"
+
+
+def test_rank_candidates_record_and_session_supersession_compose() -> None:
+    # Record-level and session-level supersession both flag; a record matched
+    # by EITHER is superseded.
+    cands = [
+        _candidate("rec", 2.0, session_id="s-live"),  # record-level superseded
+        _candidate("ses", 2.0, session_id="s-dead"),  # session-level superseded
+        _candidate("ok", 2.0, session_id="s-live"),  # neither
+    ]
+    ranked = rank_candidates(
+        cands,
+        superseded_ids={"rec"},
+        superseded_session_ids={"s-dead"},
+        now_ms=NOW_MS,
+    )
+    by_uuid = {c["uuid"]: c for c in ranked}
+    assert by_uuid["rec"]["superseded"] is True
+    assert by_uuid["ses"]["superseded"] is True
+    assert by_uuid["ok"]["superseded"] is False
+
+
 def test_rank_candidates_attaches_transparency_fields() -> None:
     ranked = rank_candidates(
         [_candidate("a", 1.0)], superseded_ids=set(), now_ms=NOW_MS

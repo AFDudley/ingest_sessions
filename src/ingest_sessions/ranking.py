@@ -177,6 +177,7 @@ def rank_candidates(
     *,
     superseded_ids: set[str],
     now_ms: int,
+    superseded_session_ids: set[str] | None = None,
     half_life_seconds: float = DEFAULT_HALF_LIFE_SECONDS,
     superseded_penalty: float = DEFAULT_SUPERSEDED_PENALTY,
     summary_tier_penalty: float = DEFAULT_SUMMARY_TIER_PENALTY,
@@ -184,15 +185,20 @@ def rank_candidates(
     """Rank reranked candidates by composed score (pure, data-in/data-out).
 
     Each candidate dict must carry ``uuid``, ``rerank_score`` (the cross-encoder
-    relevance logit), and ``raw`` (the parsed record). It may carry ``tier``
-    (defaults to ``'primary'``) and ``confidence`` (defaults to
-    ``default_confidence(raw)``). For each candidate this:
+    relevance logit), and ``raw`` (the parsed record). It may carry
+    ``session_id`` (the transcript it belongs to), ``tier`` (defaults to
+    ``'primary'``) and ``confidence`` (defaults to ``default_confidence(raw)``).
+    For each candidate this:
 
       * converts ``rerank_score`` to a non-negative ``relevance`` via sigmoid,
       * derives ``age_seconds`` from the record timestamp vs the injected
         ``now_ms`` (a record with no parseable timestamp is treated as age 0 —
         no recency penalty),
-      * looks up ``superseded = uuid in superseded_ids``,
+      * marks ``superseded`` when the candidate's ``uuid`` is in
+        ``superseded_ids`` (RECORD-level supersession) OR its ``session_id`` is
+        in ``superseded_session_ids`` (SESSION-level supersession — every
+        record of a superseded session is flagged, even one whose own uuid is
+        not directly listed),
       * calls ``compose_score``,
 
     and returns a NEW list (originals untouched) of candidate dicts each
@@ -202,6 +208,7 @@ def rank_candidates(
     Ties break by ``uuid`` for stable, reproducible ordering.
     """
     now_s = now_ms / 1000.0
+    session_ids = superseded_session_ids or set()
     ranked: list[dict[str, Any]] = []
     for cand in candidates:
         raw = cand.get("raw")
@@ -213,7 +220,10 @@ def rank_candidates(
         confidence = cand.get("confidence")
         if confidence is None:
             confidence = default_confidence(raw_dict)
-        superseded = cand["uuid"] in superseded_ids
+        session_id = cand.get("session_id")
+        superseded = cand["uuid"] in superseded_ids or (
+            session_id is not None and session_id in session_ids
+        )
         decay = recency_decay(age_seconds, half_life_seconds)
         final = compose_score(
             relevance=relevance,
