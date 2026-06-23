@@ -69,9 +69,11 @@ from ingest_sessions.core import (
     ingest_history,
     ingest_jsonl,
     ingest_session_metadata,
-    rebuild_fts_index,
+    fetch_record_raws,
+    project_record_texts,
     record_file,
     register_functions,
+    write_fts_index,
 )
 from ingest_sessions.embeddings import embed_texts, record_text, summary_text
 
@@ -313,6 +315,102 @@ async def _run_summarize_async(session_id: str) -> dict[str, int]:
 _backfill_running: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Off-thread, atomic, throttled FTS rebuild (pebble is-e10).
+#
+# core.rebuild_fts_index ran ENTIRELY on the single DB thread: fetch every
+# (uuid, raw), then json.loads + record_text for every row in Python on that
+# one thread, then DELETE+INSERT, then create_fts_index. At ~873k rows the
+# Python parse alone took ~45 MINUTES and blocked EVERY query (all _db_execute
+# work is serialized on that thread) for the whole window. The periodic sync
+# (is-565.5) re-triggered it whenever any record was embedded, so each cycle
+# stalled the service service-wide.
+#
+# _rebuild_fts_async splits the rebuild so only the cheap phases touch the DB
+# thread; the expensive parse runs OFF it via asyncio.to_thread (DuckDB query
+# execution releases the GIL, so the DB thread keeps serving queries while the
+# worker thread parses). The residual DB-thread block is the (uuid, text)
+# INSERT plus the create_fts_index C++ index build — far smaller than the
+# parse, but NOT zero (see the docstring; create_fts_index over a large corpus
+# is itself a multi-second-to-minutes DB-thread cost that throttling bounds but
+# cannot eliminate).
+# ---------------------------------------------------------------------------
+
+# Monotonic time of the last successful FTS rebuild ('None' = never this
+# process). Read by the throttle decision (_should_rebuild_fts) so the periodic
+# sweep rebuilds at most once per INGEST_SESSIONS_FTS_MIN_INTERVAL seconds.
+_last_fts_rebuild_at: float | None = None
+
+
+def _fts_min_interval() -> float:
+    """Min seconds between THROTTLED (periodic-sweep) FTS rebuilds (default 3600).
+
+    Decouples the expensive BM25 rebuild from the embedding cadence: records get
+    embedded every INGEST_SESSIONS_SYNC_INTERVAL (vector recall stays current),
+    but the FTS snapshot is rebuilt at most this often, bounding the residual
+    DB-thread create_fts_index cost. Manual /api/sync and /api/backfill bypass
+    the throttle.
+    """
+    return float(os.environ.get("INGEST_SESSIONS_FTS_MIN_INTERVAL", "3600"))
+
+
+def _should_rebuild_fts(
+    *,
+    embedded: int,
+    throttle: bool,
+    force: bool,
+    now: float,
+    last: float | None,
+    min_interval: float,
+) -> bool:
+    """Pure decision: should this run rebuild the FTS index? (is-e10 throttle.)
+
+    - ``force`` → always (the /api/backfill repair path: rebuild even when no new
+      records were embedded, e.g. to repair a partial ``record_fts``).
+    - no new records embedded → no (the FTS corpus text is unchanged).
+    - ``throttle`` (periodic sweep) → only if ``min_interval`` has elapsed since
+      the last rebuild, so a fast sync cadence does not re-trigger the costly
+      rebuild every cycle.
+    - else (manual /api/sync) → yes: rebuild on any new records, no throttle.
+    """
+    if force:
+        return True
+    if embedded <= 0:
+        return False
+    if not throttle:
+        return True
+    if last is None:
+        return True
+    return (now - last) >= min_interval
+
+
+async def _rebuild_fts_async(*, chunk_size: int = 5000) -> int:
+    """Rebuild the BM25 FTS index with the expensive parse OFF the DB thread.
+
+    Three phases (pebble is-e10):
+      1. DB thread (fast): fetch every ``(uuid, raw)`` from ``records``.
+      2. OFF thread (``asyncio.to_thread``, chunked): the ``json.loads`` +
+         ``record_text`` projection — the ~45-min CPU loop that previously ran
+         on the DB thread. Chunking bounds peak memory and lets the event loop
+         interleave other requests between chunks.
+      3. DB thread (atomic): DELETE + INSERT + ``create_fts_index`` in ONE
+         transaction (:func:`core.write_fts_index`).
+
+    Returns the indexed row count. The DB thread is touched only by the fetch
+    and the transactional write; the multi-minute Python parse no longer blocks
+    it. The create_fts_index C++ build in phase 3 is the residual DB-thread
+    block — far smaller than the parse, throttled (not eliminated) at scale.
+    """
+    rows = await _db_execute(fetch_record_raws)
+    projection: list[tuple[str, str]] = []
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        projection.extend(await asyncio.to_thread(project_record_texts, chunk))
+        # Yield so queued requests interleave between parse chunks.
+        await asyncio.sleep(0)
+    return await _db_execute(partial(write_fts_index, projection=projection))
+
+
 def _max_embedded_uuid(db: duckdb.DuckDBPyConnection) -> str:
     """Highest uuid already in record_embeddings ('' when empty) — keyset start."""
     row = db.execute("SELECT max(uuid) FROM record_embeddings").fetchone()
@@ -353,7 +451,7 @@ async def _run_backfill_async(*, batch_size: int = 256) -> dict[str, int | str]:
     search keeps working during the backfill; a modest batch_size keeps the
     per-batch HNSW maintenance small.
     """
-    global _backfill_running
+    global _backfill_running, _last_fts_rebuild_at
     if _backfill_running:
         return {"status": "already_running"}
     _backfill_running = True
@@ -391,7 +489,13 @@ async def _run_backfill_async(*, batch_size: int = 256) -> dict[str, int | str]:
             # Yield so other requests interleave between batches.
             await asyncio.sleep(0)
 
-        fts_rows = await _db_execute(lambda db: rebuild_fts_index(db))
+        # Backfill is the operator-driven repair path: ALWAYS rebuild FTS
+        # (off-thread, atomic), even when 0 records were embedded — this is how
+        # a partial/inconsistent record_fts gets repaired to records-count
+        # (pebble is-e10). Reset the throttle clock so the periodic sweep does
+        # not immediately rebuild again.
+        fts_rows = await _rebuild_fts_async()
+        _last_fts_rebuild_at = time.monotonic()
         _log(f"done: embedded={embedded} fts_rows={fts_rows}")
         return {"embedded": embedded, "fts_rows": fts_rows}
     finally:
@@ -496,8 +600,14 @@ async def _sync_summary_embeddings(batch_size: int) -> int:
     return embedded
 
 
-async def _run_sync_async(*, batch_size: int = 256) -> dict[str, int | bool | str]:
-    """Embed every record + summary missing an embedding, rebuild FTS if any.
+async def _run_sync_async(
+    *,
+    batch_size: int = 256,
+    throttle_fts: bool = False,
+    force_fts: bool = False,
+    now: float | None = None,
+) -> dict[str, int | bool | str]:
+    """Embed every record + summary missing an embedding, maybe rebuild FTS.
 
     Returns ``{"embedded": N, "summaries_embedded": M, "fts_rebuilt": bool}`` on
     completion, or ``{"status": "already_running"}`` if a backfill/sync is
@@ -506,12 +616,24 @@ async def _run_sync_async(*, batch_size: int = 256) -> dict[str, int | bool | st
 
     One sweep keeps BOTH the ``record_embeddings`` and ``summary_embeddings``
     sidecars in sync with their source tables (is-565.4): records via the
-    anti-join below, summaries via ``_sync_summary_embeddings``. The FTS index
-    is rebuilt once at the end iff this run embedded > 0 RECORD rows (the only
-    way the records FTS corpus changed; summaries have no FTS arm). The HNSW
-    vector indexes stay in place (incremental inserts) so search keeps working.
+    anti-join below, summaries via ``_sync_summary_embeddings``. The HNSW vector
+    indexes stay in place (incremental inserts) so search keeps working.
+
+    The FTS rebuild (the expensive snapshot refresh) is gated by
+    :func:`_should_rebuild_fts` (pebble is-e10):
+
+    - ``throttle_fts`` (the periodic ``_sync_loop``): rebuild iff this run
+      embedded RECORD rows AND ``INGEST_SESSIONS_FTS_MIN_INTERVAL`` has elapsed
+      since the last rebuild — so a 5-min embedding cadence does not re-trigger
+      the costly rebuild every cycle.
+    - default / manual ``/api/sync`` (``throttle_fts=False``): rebuild iff this
+      run embedded RECORD rows (the pre-is-e10 contract, no throttle).
+    - ``force_fts``: always rebuild (operator repair path).
+
+    The rebuild itself runs OFF the DB thread (``_rebuild_fts_async``). ``now``
+    is injectable for deterministic throttle tests (defaults to ``monotonic``).
     """
-    global _backfill_running
+    global _backfill_running, _last_fts_rebuild_at
     if _backfill_running:
         return {"status": "already_running"}
     _backfill_running = True
@@ -538,9 +660,18 @@ async def _run_sync_async(*, batch_size: int = 256) -> dict[str, int | bool | st
 
         summaries_embedded = await _sync_summary_embeddings(batch_size)
 
+        clock = time.monotonic() if now is None else now
         fts_rebuilt = False
-        if embedded > 0:
-            await _db_execute(lambda db: rebuild_fts_index(db))
+        if _should_rebuild_fts(
+            embedded=embedded,
+            throttle=throttle_fts,
+            force=force_fts,
+            now=clock,
+            last=_last_fts_rebuild_at,
+            min_interval=_fts_min_interval(),
+        ):
+            await _rebuild_fts_async()
+            _last_fts_rebuild_at = clock
             fts_rebuilt = True
         return {
             "embedded": embedded,
@@ -569,7 +700,10 @@ async def _sync_loop(interval: float) -> None:
     while True:
         await asyncio.sleep(interval)
         try:
-            result = await _run_sync_async()
+            # Periodic sweep: THROTTLE the FTS rebuild so a fast embedding
+            # cadence does not re-trigger the costly rebuild every cycle
+            # (pebble is-e10). Manual /api/sync + /api/backfill are not throttled.
+            result = await _run_sync_async(throttle_fts=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — log + advance to next sweep
@@ -919,6 +1053,14 @@ async def list_tools() -> list[Tool]:
                             "Await completion and return counts (default false)."
                         ),
                     },
+                    "force_fts": {
+                        "type": "boolean",
+                        "description": (
+                            "Force a clean FTS rebuild even with no new records "
+                            "(repair a partial/inconsistent record_fts; default "
+                            "false)."
+                        ),
+                    },
                 },
             },
         ),
@@ -1032,13 +1174,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     if name == "sync":
         batch_size = arguments.get("batch_size", 256)
+        # force_fts=true forces a clean FTS rebuild even with no new records —
+        # the operator repair path for a partial/inconsistent record_fts (is-e10).
+        force_fts = bool(arguments.get("force_fts", False))
         if arguments.get("wait"):
-            result = await _run_sync_async(batch_size=batch_size)
+            result = await _run_sync_async(batch_size=batch_size, force_fts=force_fts)
             return [TextContent(type="text", text=json.dumps(result))]
 
         async def _bg_sync() -> None:
             try:
-                result = await _run_sync_async(batch_size=batch_size)
+                result = await _run_sync_async(
+                    batch_size=batch_size, force_fts=force_fts
+                )
                 print(f"[ingest-sessions] sync: {result}", file=sys.stderr)
             except Exception as exc:
                 print(f"[ingest-sessions] sync failed: {exc}", file=sys.stderr)
@@ -1363,9 +1510,12 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
         """
         body = await request.json()
         batch_size = int(body.get("batch_size", 256))
+        # force_fts=true forces a clean FTS rebuild even with no new records —
+        # the operator repair path for a partial/inconsistent record_fts (is-e10).
+        force_fts = bool(body.get("force_fts", False))
 
         if body.get("wait"):
-            result = await _run_sync_async(batch_size=batch_size)
+            result = await _run_sync_async(batch_size=batch_size, force_fts=force_fts)
             status = 409 if result.get("status") == "already_running" else 200
             return starlette.responses.JSONResponse(result, status_code=status)
 
@@ -1376,7 +1526,9 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
 
         async def _bg_sync() -> None:
             try:
-                result = await _run_sync_async(batch_size=batch_size)
+                result = await _run_sync_async(
+                    batch_size=batch_size, force_fts=force_fts
+                )
                 print(f"[ingest-sessions] sync: {result}", file=sys.stderr)
             except Exception as exc:
                 print(f"[ingest-sessions] sync failed: {exc}", file=sys.stderr)
