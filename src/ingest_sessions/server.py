@@ -13,6 +13,7 @@ connections in the same process, so one thread, one connection, one queue.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import queue
@@ -398,6 +399,134 @@ async def _run_backfill_async(*, batch_size: int = 256) -> dict[str, int | str]:
 
 
 # ---------------------------------------------------------------------------
+# Automatic ongoing sync (is-565.5): keep record_embeddings + the FTS index in
+# sync with `records` automatically, WITHOUT downtime. Ingestion
+# (_ingest_file_full / _ingest_all / the watchdog) writes raw rows into
+# `records` but does NOT embed them, so the embedding/FTS sidecars drift as new
+# sessions arrive and retrieval silently loses recall on new content. A
+# periodic background sweep closes that gap.
+#
+# The sweep uses an ANTI-JOIN (records LEFT JOIN record_embeddings WHERE NULL),
+# NOT the keyset-from-max(uuid) pagination the bulk backfill uses. Record uuids
+# are RANDOM, so a record ingested with a uuid BELOW the keyset cursor after the
+# cursor already passed is never revisited by keyset pagination — re-running the
+# backfill still misses it. The anti-join finds every unembedded record
+# regardless of uuid ordering, so coverage is eventually-consistent by
+# construction: any newly-ingested record gets embedded within one interval.
+#
+# The sweep shares the _backfill_running guard with the bulk backfill so a sync
+# and a manual backfill never run concurrently (DuckDB single writer; avoids
+# double-embed + HNSW thrash). Embedding runs OFF the DB thread via
+# asyncio.to_thread (onnxruntime releases the GIL).
+# ---------------------------------------------------------------------------
+
+
+def _fetch_unembedded_antijoin(
+    db: duckdb.DuckDBPyConnection, *, limit: int
+) -> list[tuple[str, str]]:
+    """Next batch of (uuid, raw) for records lacking an embedding — anti-join.
+
+    Unlike the keyset PK range scan in ``_fetch_unembedded_batch``, this catches
+    ANY unembedded record regardless of where its (random) uuid sorts: a record
+    ingested with a uuid below an already-embedded uuid — invisible to
+    ``uuid > cursor`` keyset pagination — is found here. Each sweep iteration
+    inserts the embeddings for the batch it fetched, so the next anti-join
+    excludes them and the loop terminates.
+    """
+    return db.execute(
+        "SELECT r.uuid, r.raw FROM records r "
+        "LEFT JOIN record_embeddings e ON r.uuid = e.uuid "
+        "WHERE e.uuid IS NULL LIMIT ?",
+        [limit],
+    ).fetchall()
+
+
+async def _run_sync_async(*, batch_size: int = 256) -> dict[str, int | bool | str]:
+    """Embed every record missing an embedding (anti-join), rebuild FTS if any.
+
+    Returns ``{"embedded": N, "fts_rebuilt": bool}`` on completion, or
+    ``{"status": "already_running"}`` if a backfill/sync is already in flight
+    (shares the bulk backfill's guard — only one embedding writer at a time).
+
+    The FTS index is rebuilt once at the end iff this run embedded > 0 rows
+    (the only way `records` content changed relative to the index). The HNSW
+    vector index stays in place (incremental inserts) so search keeps working.
+    """
+    global _backfill_running
+    if _backfill_running:
+        return {"status": "already_running"}
+    _backfill_running = True
+    try:
+        embedded = 0
+        while True:
+            rows = await _db_execute(
+                partial(_fetch_unembedded_antijoin, limit=batch_size)
+            )
+            if not rows:
+                break
+            texts = [record_text(json.loads(raw)) for _uuid, raw in rows]
+            # Expensive, GIL-releasing — keep OFF the DB thread and event loop.
+            vectors = await asyncio.to_thread(embed_texts, texts)
+            now_ms = int(time.time() * 1000)
+            params = [
+                (uuid, vector, now_ms)
+                for (uuid, _raw), vector in zip(rows, vectors, strict=True)
+            ]
+            await _db_execute(partial(_insert_embeddings_batch, rows=params))
+            embedded += len(rows)
+            # Yield so other requests interleave between batches.
+            await asyncio.sleep(0)
+
+        fts_rebuilt = False
+        if embedded > 0:
+            await _db_execute(lambda db: rebuild_fts_index(db))
+            fts_rebuilt = True
+        return {"embedded": embedded, "fts_rebuilt": fts_rebuilt}
+    finally:
+        _backfill_running = False
+
+
+def _sync_interval() -> float:
+    """Seconds between automatic sync sweeps (env override, default 300)."""
+    return float(os.environ.get("INGEST_SESSIONS_SYNC_INTERVAL", "300"))
+
+
+async def _sync_loop(interval: float) -> None:
+    """Periodic driver: every `interval`s, run an anti-join sync sweep.
+
+    This is a poll-for-new-work loop (each tick is a fresh sweep of whatever
+    is currently unembedded), NOT a retry loop — it never re-attempts the same
+    failed operation, it advances to the next interval's work. A sweep failure
+    is logged loudly and the schedule continues, so one transient embedding
+    error never silently disables ongoing sync. CancelledError propagates so
+    shutdown stops the loop cleanly.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            result = await _run_sync_async()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — log + advance to next sweep
+            print(f"[ingest-sessions] sync sweep failed: {exc}", file=sys.stderr)
+            continue
+        if result.get("embedded") or result.get("fts_rebuilt"):
+            print(f"[ingest-sessions] sync: {result}", file=sys.stderr)
+
+
+def _start_sync_task() -> asyncio.Task[None]:
+    """Fire-and-forget the periodic sync driver (does NOT block startup)."""
+    return asyncio.ensure_future(_sync_loop(_sync_interval()))
+
+
+async def _stop_sync_task(task: asyncio.Task[None]) -> None:
+    """Cancel the periodic sync driver and await its clean teardown."""
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+# ---------------------------------------------------------------------------
 # Database thread
 # ---------------------------------------------------------------------------
 
@@ -699,6 +828,35 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="sync",
+            description=(
+                "Run an ANTI-JOIN sync sweep: embed every record currently "
+                "missing an embedding (regardless of uuid ordering — catches "
+                "late low-uuid inserts the keyset backfill misses) and rebuild "
+                "the BM25 FTS index if any rows were embedded. Keeps "
+                "record_embeddings + FTS in sync with `records` with no "
+                "downtime. The server also runs this automatically every "
+                "INGEST_SESSIONS_SYNC_INTERVAL seconds; this triggers it on "
+                "demand. wait=true awaits and returns {embedded, fts_rebuilt}; "
+                "a concurrent trigger returns 'already_running'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "batch_size": {
+                        "type": "integer",
+                        "description": "Records embedded per model call (default 256).",
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "description": (
+                            "Await completion and return counts (default false)."
+                        ),
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -807,6 +965,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         asyncio.ensure_future(_bg_backfill())
         return [TextContent(type="text", text=json.dumps({"status": "accepted"}))]
 
+    if name == "sync":
+        batch_size = arguments.get("batch_size", 256)
+        if arguments.get("wait"):
+            result = await _run_sync_async(batch_size=batch_size)
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        async def _bg_sync() -> None:
+            try:
+                result = await _run_sync_async(batch_size=batch_size)
+                print(f"[ingest-sessions] sync: {result}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[ingest-sessions] sync failed: {exc}", file=sys.stderr)
+
+        asyncio.ensure_future(_bg_sync())
+        return [TextContent(type="text", text=json.dumps({"status": "accepted"}))]
+
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -864,16 +1038,17 @@ async def read_resource(uri: AnyUrl) -> str:
 async def run_stdio() -> None:
     """Run in stdio mode (single client, good for testing)."""
     observer = _startup()
+    sync_task = _start_sync_task()
     try:
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())
     finally:
+        await _stop_sync_task(sync_task)
         _shutdown(observer)
 
 
 def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
     """Run as a streamable-HTTP server (multi-client)."""
-    import contextlib
     from collections.abc import AsyncIterator
 
     import uvicorn
@@ -900,10 +1075,12 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
         nonlocal observer
         observer = _startup()
+        sync_task = _start_sync_task()
         async with session_manager.run():
             try:
                 yield
             finally:
+                await _stop_sync_task(sync_task)
                 _shutdown(observer)
 
     async def handle_context_api(
@@ -1106,6 +1283,44 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             {"status": "accepted", "batch_size": batch_size}, status_code=202
         )
 
+    async def handle_sync_api(
+        request: starlette.requests.Request,
+    ) -> starlette.responses.JSONResponse:
+        """REST endpoint for an on-demand anti-join sync sweep (is-565.5).
+
+        POST /api/sync with optional {"batch_size": int, "wait": bool}.
+        Default launches the sweep in the background and returns 202
+        {"status": "accepted"}; wait=true awaits and returns
+        {"embedded", "fts_rebuilt"} (used by tests / operational one-shots).
+        A concurrent trigger while a backfill/sync is in flight returns 409
+        {"status": "already_running"}. The server also runs this sweep
+        automatically every INGEST_SESSIONS_SYNC_INTERVAL seconds.
+        """
+        body = await request.json()
+        batch_size = int(body.get("batch_size", 256))
+
+        if body.get("wait"):
+            result = await _run_sync_async(batch_size=batch_size)
+            status = 409 if result.get("status") == "already_running" else 200
+            return starlette.responses.JSONResponse(result, status_code=status)
+
+        if _backfill_running:
+            return starlette.responses.JSONResponse(
+                {"status": "already_running"}, status_code=409
+            )
+
+        async def _bg_sync() -> None:
+            try:
+                result = await _run_sync_async(batch_size=batch_size)
+                print(f"[ingest-sessions] sync: {result}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[ingest-sessions] sync failed: {exc}", file=sys.stderr)
+
+        asyncio.ensure_future(_bg_sync())
+        return starlette.responses.JSONResponse(
+            {"status": "accepted", "batch_size": batch_size}, status_code=202
+        )
+
     import starlette.requests
     import starlette.responses
     from starlette.routing import Route
@@ -1120,6 +1335,7 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             Route("/api/retrieve", handle_retrieve_api, methods=["POST"]),
             Route("/api/supersessions", handle_supersessions_api, methods=["POST"]),
             Route("/api/backfill", handle_backfill_api, methods=["POST"]),
+            Route("/api/sync", handle_sync_api, methods=["POST"]),
         ],
         lifespan=lifespan,
     )

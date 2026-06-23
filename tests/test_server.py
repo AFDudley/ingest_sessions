@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -917,3 +918,251 @@ async def test_backfill_concurrency_guard():
         assert result == {"status": "already_running"}
     finally:
         srv._backfill_running = False
+
+
+# ---------------------------------------------------------------------------
+# Automatic ongoing embedding + FTS sync (is-565.5): a periodic anti-join
+# sweep keeps record_embeddings + the FTS index in sync with `records` as new
+# sessions are ingested — closing the keyset-gap the bulk backfill leaves.
+# ---------------------------------------------------------------------------
+
+
+def _record(uuid: str, content: str, *, parent: str | None = None) -> dict:
+    """A minimal user record with a chosen uuid (uuids are random in prod)."""
+    return {
+        "uuid": uuid,
+        "sessionId": "sync-sess",
+        "type": "user",
+        "timestamp": "2026-03-02T09:00:00.000Z",
+        "parentUuid": parent,
+        "message": {"role": "user", "content": content},
+    }
+
+
+def _write_session(tmp_path: Path, name: str, records: list[dict]) -> Path:
+    """Write a session JSONL under the projects dir, return its path."""
+    proj_dir = tmp_path / "projects" / "myproject"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    path = proj_dir / f"{name}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return path
+
+
+async def _count(client: ClientSession, table: str) -> int:
+    rows = json.loads(
+        _text(
+            await client.call_tool(
+                "query", {"sql": f"SELECT count(*) AS n FROM {table}"}
+            )
+        )
+    )
+    return rows[0]["n"]
+
+
+@pytest.mark.asyncio
+async def test_server_lists_sync_tool(tmp_path: Path):
+    """The server should list 'sync' as an available tool."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.list_tools()
+        assert "sync" in [t.name for t in result.tools]
+
+
+@pytest.mark.asyncio
+async def test_sync_embeds_corpus_and_enables_retrieval(tmp_path: Path):
+    """Slice e2e: an on-demand sync sweep embeds every record + rebuilds FTS.
+
+    Seed a corpus, trigger sync (wait=true) over the live server's single DB
+    connection, and assert every record got an embedding row, the FTS
+    projection is populated, fts_rebuilt is True, and retrieve_relevant returns
+    a relevant hit — the anti-join sweep end-to-end with real models.
+    """
+    _write_session(
+        tmp_path,
+        "sync-sess",
+        [
+            _record("u-900", "How does the gateway settle x402 payments on Solana?"),
+            _record(
+                "u-901",
+                "The gateway caches x402 spend; the Solana chain is the source of truth.",
+                parent="u-900",
+            ),
+        ],
+    )
+
+    async with run_server(tmp_path) as (client, _):
+        body = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert body["embedded"] == 2
+        assert body["fts_rebuilt"] is True
+
+        assert await _count(client, "record_embeddings") == 2
+        assert await _count(client, "records") == 2
+        assert await _count(client, "record_fts") == 2
+
+        hits = json.loads(
+            _text(
+                await client.call_tool(
+                    "retrieve_relevant",
+                    {"query": "how are x402 payments settled on Solana"},
+                )
+            )
+        )
+        assert len(hits) > 0
+        assert any(h["uuid"] in {"u-900", "u-901"} for h in hits)
+
+
+@pytest.mark.asyncio
+async def test_sync_catches_low_uuid_late_insert_keyset_gap(tmp_path: Path):
+    """HEADLINE: the anti-join sweep embeds a record whose uuid sorts BELOW an
+    already-embedded uuid — the exact record the keyset backfill misses.
+
+    Ingest high-uuid records and sync (max embedded uuid is now 'u-901'). Then
+    ingest a NEW record with uuid 'a-001', which sorts BELOW 'u-901': keyset
+    pagination (WHERE uuid > 'u-901') would never revisit it, so a re-run of
+    the bulk backfill leaves it unembedded. The anti-join sweep finds it.
+    """
+    _write_session(
+        tmp_path,
+        "sync-high",
+        [
+            _record("u-900", "high uuid record one"),
+            _record("u-901", "high uuid record two"),
+        ],
+    )
+
+    async with run_server(tmp_path) as (client, _):
+        first = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert first["embedded"] == 2
+
+        # Ingest a record whose (random) uuid sorts below the embedded tail.
+        # refresh guarantees ingestion regardless of watchdog timing; if the
+        # watchdog already ingested it, refresh is an idempotent no-op (0 new).
+        late = _write_session(
+            tmp_path, "sync-late", [_record("a-001", "late low-uuid record")]
+        )
+        await client.call_tool("refresh", {"path": str(late)})
+        assert await _count(client, "records") == 3
+
+        # Re-running the keyset BACKFILL misses the low-uuid late insert.
+        backfill = json.loads(_text(await client.call_tool("backfill", {"wait": True})))
+        assert backfill["embedded"] == 0
+        assert await _count(client, "record_embeddings") == 2
+
+        # The anti-join SYNC catches it: a-001 gets embedded.
+        second = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert second["embedded"] == 1
+        assert second["fts_rebuilt"] is True
+        assert await _count(client, "record_embeddings") == 3
+
+        embedded_uuids = json.loads(
+            _text(
+                await client.call_tool(
+                    "query", {"sql": "SELECT uuid FROM record_embeddings ORDER BY uuid"}
+                )
+            )
+        )
+        assert {row["uuid"] for row in embedded_uuids} == {"a-001", "u-900", "u-901"}
+
+
+@pytest.mark.asyncio
+async def test_sync_is_idempotent(tmp_path: Path):
+    """A second sync over an unchanged corpus embeds 0 and skips FTS rebuild."""
+    _write_session(tmp_path, "sync-sess", [_record("u-900", "idempotent record")])
+
+    async with run_server(tmp_path) as (client, _):
+        first = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert first["embedded"] == 1
+        assert first["fts_rebuilt"] is True
+
+        second = json.loads(_text(await client.call_tool("sync", {"wait": True})))
+        assert second["embedded"] == 0
+        assert second["fts_rebuilt"] is False
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_eventually_embeds_new_records(tmp_path: Path):
+    """The background driver embeds newly-ingested records within one interval.
+
+    Start the server with a 1s sync interval and a seeded corpus. The startup
+    ingestion writes raw rows but NOT embeddings; the periodic driver fires and
+    fills them in. Polling proves eventual consistency by construction and that
+    the fire-and-forget task runs (and is cancelled cleanly on shutdown — the
+    context manager exit would hang otherwise).
+    """
+    _write_session(
+        tmp_path,
+        "sync-sess",
+        [
+            _record("u-900", "periodic record one"),
+            _record("u-901", "periodic record two"),
+        ],
+    )
+
+    async with run_server(tmp_path, {"INGEST_SESSIONS_SYNC_INTERVAL": "1"}) as (
+        client,
+        _,
+    ):
+        deadline = time.monotonic() + 60
+        embedded = 0
+        while time.monotonic() < deadline:
+            embedded = await _count(client, "record_embeddings")
+            if embedded == 2:
+                break
+            await asyncio.sleep(0.5)
+        assert embedded == 2
+        assert await _count(client, "record_fts") == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_concurrency_guard():
+    """Sync shares the backfill guard: an in-flight run rejects a concurrent one.
+
+    The flag is flipped synchronously before the first await, so the concurrent
+    invocation returns 'already_running' WITHOUT touching the DB — no running
+    DB thread needed (it returns before the first _db_execute).
+    """
+    import ingest_sessions.server as srv
+
+    srv._backfill_running = True
+    try:
+        result = await srv._run_sync_async()
+        assert result == {"status": "already_running"}
+    finally:
+        srv._backfill_running = False
+
+
+def test_antijoin_finds_low_uuid_gap_that_keyset_misses():
+    """Unit proof of the correctness fix, no model: keyset pagination misses a
+    low-uuid late insert; the anti-join finds it.
+
+    Build a DB with two embedded high-uuid records and one UN-embedded record
+    whose uuid sorts below them. The keyset helper, started from
+    max(record_embeddings.uuid), returns nothing; the anti-join helper returns
+    exactly the unembedded low-uuid record.
+    """
+    import duckdb
+
+    import ingest_sessions.server as srv
+    from ingest_sessions.core import create_tables
+
+    db = duckdb.connect(":memory:")
+    create_tables(db)
+    for uuid in ("a-001", "u-900", "u-901"):
+        db.execute(
+            "INSERT INTO records VALUES (?, 'sess', 'user', NULL, NULL, ?)",
+            [uuid, json.dumps(_record(uuid, "x"))],
+        )
+    # Only the two HIGH-uuid records are embedded.
+    for uuid in ("u-900", "u-901"):
+        db.execute(
+            "INSERT INTO record_embeddings VALUES (?, ?, 0)", [uuid, [0.0] * 384]
+        )
+
+    cursor = srv._max_embedded_uuid(db)
+    assert cursor == "u-901"
+    # Keyset pagination from the embedded tail MISSES the low-uuid record.
+    keyset = srv._fetch_unembedded_batch(db, after=cursor, limit=256)
+    assert keyset == []
+    # The anti-join FINDS exactly the unembedded low-uuid record.
+    antijoin = srv._fetch_unembedded_antijoin(db, limit=256)
+    assert [uuid for uuid, _raw in antijoin] == ["a-001"]
+    db.close()
