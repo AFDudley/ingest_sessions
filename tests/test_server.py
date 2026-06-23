@@ -774,3 +774,146 @@ async def test_rest_context_endpoint(tmp_path: Path):
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# In-server background backfill (is-565.2): embed not-yet-embedded records +
+# rebuild the BM25 FTS index while the server keeps serving — replacing the
+# exclusive-lock scripts/backfill_corpus.py for production use.
+# ---------------------------------------------------------------------------
+
+_BACKFILL_RECORDS = [
+    {
+        "uuid": "bf-001",
+        "sessionId": "bf-sess",
+        "type": "user",
+        "timestamp": "2026-03-01T12:00:00.000Z",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": "How does the gateway settle x402 payments on Solana?",
+        },
+    },
+    {
+        "uuid": "bf-002",
+        "sessionId": "bf-sess",
+        "type": "assistant",
+        "timestamp": "2026-03-01T12:00:05.000Z",
+        "parentUuid": "bf-001",
+        "message": {
+            "role": "assistant",
+            "content": (
+                "The gateway caches x402 spend and treats the Solana chain "
+                "as the source of truth for settlement."
+            ),
+        },
+    },
+    {
+        "uuid": "bf-003",
+        "sessionId": "bf-sess",
+        "type": "user",
+        "timestamp": "2026-03-01T12:01:00.000Z",
+        "parentUuid": "bf-002",
+        "message": {
+            "role": "user",
+            "content": "Remind me to water the office plants on Friday.",
+        },
+    },
+]
+
+
+def _seed_backfill_corpus(tmp_path: Path) -> int:
+    """Write a tiny multi-record session and return the record count."""
+    proj_dir = tmp_path / "projects" / "myproject"
+    proj_dir.mkdir(parents=True)
+    lines = "\n".join(json.dumps(r) for r in _BACKFILL_RECORDS) + "\n"
+    (proj_dir / "bf-sess.jsonl").write_text(lines)
+    return len(_BACKFILL_RECORDS)
+
+
+@pytest.mark.asyncio
+async def test_server_lists_backfill_tool(tmp_path: Path):
+    """The server should list 'backfill' as an available tool."""
+    async with run_server(tmp_path) as (client, _):
+        result = await client.list_tools()
+        assert "backfill" in [t.name for t in result.tools]
+
+
+@pytest.mark.asyncio
+async def test_backfill_embeds_corpus_and_enables_retrieval(tmp_path: Path):
+    """Slice e2e: a running server backfills embeddings + FTS in-process.
+
+    Seed a small corpus, trigger backfill (wait=true) over the live server's
+    single DB connection, and assert every record got an embedding row, the
+    FTS projection is populated, and retrieve_relevant now returns a relevant
+    hit — proving the in-server background backfill path end-to-end with real
+    models (no second DB connection, no downtime).
+    """
+    n = _seed_backfill_corpus(tmp_path)
+
+    async with run_server(tmp_path) as (client, _):
+        result = await client.call_tool("backfill", {"wait": True})
+        body = json.loads(_text(result))
+        assert body["embedded"] == n
+        assert body["fts_rows"] == n
+
+        rows = json.loads(
+            _text(
+                await client.call_tool(
+                    "query", {"sql": "SELECT count(*) AS n FROM record_embeddings"}
+                )
+            )
+        )
+        assert rows == [{"n": n}]
+
+        rows = json.loads(
+            _text(
+                await client.call_tool(
+                    "query", {"sql": "SELECT count(*) AS n FROM record_fts"}
+                )
+            )
+        )
+        assert rows == [{"n": n}]
+
+        hits = json.loads(
+            _text(
+                await client.call_tool(
+                    "retrieve_relevant",
+                    {"query": "how are x402 payments settled on Solana"},
+                )
+            )
+        )
+        assert len(hits) > 0
+        assert any(h["uuid"] in {"bf-001", "bf-002"} for h in hits)
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_idempotent(tmp_path: Path):
+    """A second backfill over an unchanged corpus embeds 0 records."""
+    _seed_backfill_corpus(tmp_path)
+
+    async with run_server(tmp_path) as (client, _):
+        first = json.loads(_text(await client.call_tool("backfill", {"wait": True})))
+        assert first["embedded"] == len(_BACKFILL_RECORDS)
+
+        second = json.loads(_text(await client.call_tool("backfill", {"wait": True})))
+        assert second["embedded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_concurrency_guard():
+    """Only one backfill runs at a time; a second in-flight trigger is rejected.
+
+    The driver flips a module-level flag synchronously before its first await,
+    so a concurrent invocation observes the flag set and returns
+    'already_running' WITHOUT touching the DB (it returns before the first
+    _db_execute) — which is why this guard test needs no running DB thread.
+    """
+    import ingest_sessions.server as srv
+
+    srv._backfill_running = True
+    try:
+        result = await srv._run_backfill_async()
+        assert result == {"status": "already_running"}
+    finally:
+        srv._backfill_running = False

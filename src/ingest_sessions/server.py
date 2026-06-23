@@ -18,6 +18,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -67,9 +68,11 @@ from ingest_sessions.core import (
     ingest_history,
     ingest_jsonl,
     ingest_session_metadata,
+    rebuild_fts_index,
     record_file,
     register_functions,
 )
+from ingest_sessions.embeddings import embed_texts, record_text
 
 T = TypeVar("T")
 
@@ -289,6 +292,109 @@ async def _run_summarize_async(session_id: str) -> dict[str, int]:
         "bindles_created": bindles_created,
         "unsummarized_remaining": len(unsummarized) - (full_chunks * SPRIG_CHUNK_SIZE),
     }
+
+
+# ---------------------------------------------------------------------------
+# In-server background backfill (is-565.2): embed not-yet-embedded records and
+# rebuild the BM25 FTS index WHILE the server keeps serving — the no-downtime
+# replacement for the exclusive-lock scripts/backfill_corpus.py. Mirrors the
+# summarize background pattern: expensive embedding work runs OFF the DB thread
+# via asyncio.to_thread (onnxruntime releases the GIL, so the event loop + DB
+# thread stay responsive); every DB read/write goes through the single DB
+# thread via _db_execute (DuckDB forbids a second in-process connection).
+# ---------------------------------------------------------------------------
+
+# Module-level guard: only ONE backfill runs at a time. The single event loop
+# makes a check-then-set across no await atomic, so the driver flips this True
+# synchronously before its first await; a concurrent trigger sees it set and
+# returns "already_running" instead of starting a parallel run (which would
+# double-embed + thrash the HNSW index).
+_backfill_running: bool = False
+
+
+def _max_embedded_uuid(db: duckdb.DuckDBPyConnection) -> str:
+    """Highest uuid already in record_embeddings ('' when empty) — keyset start."""
+    row = db.execute("SELECT max(uuid) FROM record_embeddings").fetchone()
+    return row[0] if row and row[0] is not None else ""
+
+
+def _fetch_unembedded_batch(
+    db: duckdb.DuckDBPyConnection, *, after: str, limit: int
+) -> list[tuple[str, str]]:
+    """Next batch of (uuid, raw) with uuid > cursor — a PK range scan.
+
+    Keyset pagination by the uuid primary key, NOT a ``LEFT JOIN
+    record_embeddings ... ORDER BY uuid`` anti-join: the anti-join re-sorts the
+    whole corpus every batch (measured 3x slower). Because the cursor starts at
+    max(record_embeddings.uuid) and the records scan is uuid-ordered, ``uuid >
+    cursor`` is exactly the not-yet-embedded tail.
+    """
+    return db.execute(
+        "SELECT uuid, raw FROM records WHERE uuid > ? ORDER BY uuid LIMIT ?",
+        [after, limit],
+    ).fetchall()
+
+
+def _insert_embeddings_batch(
+    db: duckdb.DuckDBPyConnection, *, rows: list[tuple[str, list[float], int]]
+) -> None:
+    """Insert a batch of (uuid, embedding, embedded_at). Idempotent."""
+    db.executemany("INSERT OR IGNORE INTO record_embeddings VALUES (?, ?, ?)", rows)
+
+
+async def _run_backfill_async(*, batch_size: int = 256) -> dict[str, int | str]:
+    """Embed every not-yet-embedded record, then rebuild the FTS index once.
+
+    Returns ``{"embedded": N, "fts_rows": M}`` on completion, or
+    ``{"status": "already_running"}`` if a backfill is already in flight.
+
+    The HNSW vector index is kept in place (incremental inserts) so vector
+    search keeps working during the backfill; a modest batch_size keeps the
+    per-batch HNSW maintenance small.
+    """
+    global _backfill_running
+    if _backfill_running:
+        return {"status": "already_running"}
+    _backfill_running = True
+    try:
+        cursor = await _db_execute(_max_embedded_uuid)
+        embedded = 0
+        batches = 0
+        start = time.time()
+
+        def _log(msg: str) -> None:
+            print(f"[ingest-sessions] backfill: {msg}", file=sys.stderr)
+
+        while True:
+            rows = await _db_execute(
+                partial(_fetch_unembedded_batch, after=cursor, limit=batch_size)
+            )
+            if not rows:
+                break
+            texts = [record_text(json.loads(raw)) for _uuid, raw in rows]
+            # Embedding is the expensive, GIL-releasing work — keep it OFF the
+            # DB thread and the event loop.
+            vectors = await asyncio.to_thread(embed_texts, texts)
+            now_ms = int(time.time() * 1000)
+            params = [
+                (uuid, vector, now_ms)
+                for (uuid, _raw), vector in zip(rows, vectors, strict=True)
+            ]
+            await _db_execute(partial(_insert_embeddings_batch, rows=params))
+            cursor = rows[-1][0]
+            embedded += len(rows)
+            batches += 1
+            if batches % 20 == 0:
+                rate = embedded / max(1e-6, time.time() - start)
+                _log(f"embedded={embedded} ({rate:.0f}/s, batch {batches})")
+            # Yield so other requests interleave between batches.
+            await asyncio.sleep(0)
+
+        fts_rows = await _db_execute(lambda db: rebuild_fts_index(db))
+        _log(f"done: embedded={embedded} fts_rows={fts_rows}")
+        return {"embedded": embedded, "fts_rows": fts_rows}
+    finally:
+        _backfill_running = False
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +671,34 @@ async def list_tools() -> list[Tool]:
                 "required": ["superseding_id", "superseded_id", "source"],
             },
         ),
+        Tool(
+            name="backfill",
+            description=(
+                "Embed all not-yet-embedded records and rebuild the BM25 FTS "
+                "index in the BACKGROUND, without blocking request serving or "
+                "opening a second DB connection — so retrieval coverage fills "
+                "in while the service stays up. Default returns immediately "
+                "(status 'accepted'); wait=true awaits and returns "
+                "{embedded, fts_rows}. Idempotent: a second run over an "
+                "unchanged corpus embeds 0. Only one backfill runs at a time "
+                "(a concurrent trigger returns 'already_running')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "batch_size": {
+                        "type": "integer",
+                        "description": "Records embedded per model call (default 256).",
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "description": (
+                            "Await completion and return counts (default false)."
+                        ),
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -656,6 +790,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps({"inserted": inserted}))]
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+    if name == "backfill":
+        batch_size = arguments.get("batch_size", 256)
+        if arguments.get("wait"):
+            result = await _run_backfill_async(batch_size=batch_size)
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        async def _bg_backfill() -> None:
+            try:
+                result = await _run_backfill_async(batch_size=batch_size)
+                print(f"[ingest-sessions] backfill: {result}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[ingest-sessions] backfill failed: {exc}", file=sys.stderr)
+
+        asyncio.ensure_future(_bg_backfill())
+        return [TextContent(type="text", text=json.dumps({"status": "accepted"}))]
 
     raise ValueError(f"Unknown tool: {name}")
 
@@ -919,6 +1069,43 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             )
         return starlette.responses.JSONResponse({"inserted": inserted})
 
+    async def handle_backfill_api(
+        request: starlette.requests.Request,
+    ) -> starlette.responses.JSONResponse:
+        """REST endpoint for in-server background backfill (pebble is-565.2).
+
+        POST /api/backfill with optional {"batch_size": int, "wait": bool}.
+        Default launches the driver in the background and returns 202
+        {"status": "accepted"}; wait=true awaits and returns
+        {"embedded", "fts_rows"} (used by tests / operational one-shots).
+        A concurrent trigger while a run is in flight returns 409
+        {"status": "already_running"} — never starts a parallel run.
+        """
+        body = await request.json()
+        batch_size = int(body.get("batch_size", 256))
+
+        if body.get("wait"):
+            result = await _run_backfill_async(batch_size=batch_size)
+            status = 409 if result.get("status") == "already_running" else 200
+            return starlette.responses.JSONResponse(result, status_code=status)
+
+        if _backfill_running:
+            return starlette.responses.JSONResponse(
+                {"status": "already_running"}, status_code=409
+            )
+
+        async def _bg_backfill() -> None:
+            try:
+                result = await _run_backfill_async(batch_size=batch_size)
+                print(f"[ingest-sessions] backfill: {result}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[ingest-sessions] backfill failed: {exc}", file=sys.stderr)
+
+        asyncio.ensure_future(_bg_backfill())
+        return starlette.responses.JSONResponse(
+            {"status": "accepted", "batch_size": batch_size}, status_code=202
+        )
+
     import starlette.requests
     import starlette.responses
     from starlette.routing import Route
@@ -932,6 +1119,7 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
             Route("/api/session", handle_session_api, methods=["POST"]),
             Route("/api/retrieve", handle_retrieve_api, methods=["POST"]),
             Route("/api/supersessions", handle_supersessions_api, methods=["POST"]),
+            Route("/api/backfill", handle_backfill_api, methods=["POST"]),
         ],
         lifespan=lifespan,
     )
