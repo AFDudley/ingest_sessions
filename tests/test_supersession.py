@@ -16,9 +16,18 @@ from ingest_sessions.supersession import (
     add_supersession,
     add_supersessions,
     get_superseded_ids,
+    get_superseded_session_ids,
     get_supersessions_for,
     is_superseded,
 )
+
+
+def _insert_record(db: duckdb.DuckDBPyConnection, uuid: str, session_id: str) -> None:
+    """Insert a minimal record so a session_id is 'known' to the corpus."""
+    db.execute(
+        "INSERT OR IGNORE INTO records VALUES (?, ?, ?, ?, ?, ?)",
+        [uuid, session_id, "user", None, None, "{}"],
+    )
 
 
 def _columns(db: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
@@ -175,3 +184,41 @@ def test_get_supersessions_for(db: duckdb.DuckDBPyConnection) -> None:
 
 def test_get_supersessions_for_none(db: duckdb.DuckDBPyConnection) -> None:
     assert get_supersessions_for(db, "unknown") == []
+
+
+# ---------------------------------------------------------------------------
+# session-grained supersession (is-565.6): a superseded_id that names a known
+# session_id is a SESSION-level link, resolved by lookup against records.
+# ---------------------------------------------------------------------------
+
+
+def test_get_superseded_session_ids_resolves_by_lookup(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    # session 'sess-old' is known (has records); 'rec-old' is a record uuid.
+    _insert_record(db, "u1", "sess-old")
+    _insert_record(db, "u2", "sess-old")
+    _insert_record(db, "u3", "sess-new")
+    # A session-grained link (superseded_id is a known session_id) ...
+    add_supersession(db, "sess-new", "sess-old", "adr-supersedes")
+    # ... and a record-grained link (superseded_id is a record uuid, NOT a
+    # session_id) — must NOT show up in the session set.
+    add_supersession(db, "u3", "rec-old", "git-revert")
+
+    assert get_superseded_session_ids(db) == {"sess-old"}
+    # record-level query still returns the union of all superseded ids.
+    assert get_superseded_ids(db) == {"sess-old", "rec-old"}
+
+
+def test_get_superseded_session_ids_empty_without_matching_session(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    # superseded_id 'old-rec' matches no records.session_id → not session-grained.
+    add_supersession(db, "new-rec", "old-rec", "git-revert")
+    assert get_superseded_session_ids(db) == set()
+
+
+def test_get_superseded_session_ids_empty_corpus(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    assert get_superseded_session_ids(db) == set()

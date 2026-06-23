@@ -33,6 +33,15 @@ packages = ["src/ingest_sessions"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# scripts/ holds standalone operator tools (consumer-side adapters) that are
+# not part of the importable package; expose them to the test runner so their
+# PURE parse functions can be unit-tested directly.
+pythonpath = ["scripts"]
+
+[tool.mypy]
+# Resolve standalone scripts (e.g. scripts/supersession_adapter.py) when a test
+# imports them, so mypy type-checks the import rather than reporting it missing.
+mypy_path = "scripts"
 
 [dependency-groups]
 dev = [
