@@ -71,7 +71,9 @@ def test_install_hooks_creates_entries(tmp_path: Path):
     assert "PreCompact" in added
     settings = json.loads(settings_path.read_text())
     assert "hooks" in settings
-    assert len(settings["hooks"]["SessionStart"]) == 1
+    assert (
+        len(settings["hooks"]["SessionStart"]) == 2
+    )  # session_start + session_retrieve
     assert len(settings["hooks"]["PreCompact"]) == 1
 
 
@@ -90,7 +92,9 @@ def test_install_hooks_idempotent(tmp_path: Path):
 
     assert added == []
     settings = json.loads(settings_path.read_text())
-    assert len(settings["hooks"]["SessionStart"]) == 1
+    assert (
+        len(settings["hooks"]["SessionStart"]) == 2
+    )  # session_start + session_retrieve
     assert len(settings["hooks"]["PreCompact"]) == 1
 
 
@@ -120,7 +124,9 @@ def test_install_hooks_preserves_existing(tmp_path: Path):
     settings = json.loads(settings_path.read_text())
     assert settings["env"]["FOO"] == "bar"
     assert len(settings["hooks"]["PreToolUse"]) == 1
-    assert len(settings["hooks"]["SessionStart"]) == 1
+    assert (
+        len(settings["hooks"]["SessionStart"]) == 2
+    )  # session_start + session_retrieve
     assert len(settings["hooks"]["PreCompact"]) == 1
 
 

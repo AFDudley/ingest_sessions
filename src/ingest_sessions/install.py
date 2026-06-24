@@ -28,6 +28,11 @@ HOOKS_DIR = Path(__file__).parent / "hooks"
 # Each hook: (event_name, script_filename, timeout_seconds)
 HOOK_DEFS: list[tuple[str, str, int]] = [
     ("SessionStart", "session_start.py", 15),
+    # Cross-session relevance injection (is-565.7): surfaces relevant prior
+    # reasoning via retrieve_relevant. Sibling to session_start.py (which
+    # recovers the current session's summary). ~2s warm (server warms models
+    # at startup); fails open. 15s budget covers a warm call comfortably.
+    ("SessionStart", "session_retrieve.py", 15),
     ("PreCompact", "pre_compact.py", 180),
 ]
 
