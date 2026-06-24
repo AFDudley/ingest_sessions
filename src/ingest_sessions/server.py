@@ -810,12 +810,42 @@ def _start_watcher() -> BaseObserver:
     return observer
 
 
+def _warm_models() -> None:
+    """Load the embed + rerank ONNX models so the first retrieve call is warm.
+
+    The SessionStart retrieve hook (hooks/session_retrieve.py) calls
+    /api/retrieve under a ~15s budget; a cold first call loads ~180MB of ONNX
+    models (~60s) and would time out. Front-load them in a background daemon
+    thread at startup so the hook is reliably ~2s. Best-effort: a failure here
+    just means the first real call pays the cold load — never fatal to startup.
+    """
+    try:
+        from ingest_sessions.embeddings import embed_query
+        from ingest_sessions.rerank import rerank
+
+        embed_query("warm")
+        rerank("warm", ["warm"])
+        print("[ingest-sessions] retrieval models warmed", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — warming is best-effort, never fatal
+        print(f"[ingest-sessions] model warm failed: {exc}", file=sys.stderr)
+
+
 def _startup() -> BaseObserver | None:
     """Run on server start: start database thread, start watcher."""
     global _db_thread
     _startup_done.clear()
     _db_thread = _start_db_thread()
     return _start_watcher()
+
+
+def _start_warm_thread() -> None:
+    """Front-load the retrieval models in the background (HTTP server only).
+
+    Only the long-lived HTTP server serves the SessionStart retrieve hook, so
+    warming belongs there — not in the stdio/in-process path used by tests,
+    where the extra startup CPU would contend with timing-sensitive sweeps.
+    """
+    threading.Thread(target=_warm_models, daemon=True, name="warm-models").start()
 
 
 def _shutdown(observer: BaseObserver | None) -> None:
@@ -1287,6 +1317,7 @@ def run_http(host: str = "127.0.0.1", port: int | None = None) -> None:
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
         nonlocal observer
         observer = _startup()
+        _start_warm_thread()
         sync_task = _start_sync_task()
         async with session_manager.run():
             try:
