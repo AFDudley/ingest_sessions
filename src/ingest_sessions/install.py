@@ -3,7 +3,8 @@
 Idempotent: safe to run on first install or as a repair operation.
 
 Manages three components:
-1. Claude Code hooks (SessionStart, PreCompact) in ~/.claude/settings.json
+1. Claude Code hooks (SessionStart, UserPromptSubmit, PreCompact) in
+   ~/.claude/settings.json
 2. MCP server registration via ``claude mcp add``
 3. systemd user service for the ingest-sessions-server process
 
@@ -33,6 +34,12 @@ HOOK_DEFS: list[tuple[str, str, int]] = [
     # recovers the current session's summary). ~2s warm (server warms models
     # at startup); fails open. 15s budget covers a warm call comfortably.
     ("SessionStart", "session_retrieve.py", 15),
+    # is-408 fallback: SessionStart injection is dropped by the harness on a
+    # fresh `claude` (source=startup). This UserPromptSubmit hook guarantees the
+    # relevant-prior-reasoning context is injected once per session, on the
+    # first user prompt, unless SessionStart already delivered it (shared
+    # per-session marker). ~2s warm on that first prompt only; fails open.
+    ("UserPromptSubmit", "first_prompt_retrieve.py", 15),
     ("PreCompact", "pre_compact.py", 180),
 ]
 

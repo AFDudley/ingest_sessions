@@ -56,7 +56,7 @@ def test_is_our_hook_rejects_other(tmp_path: Path):
 
 
 def test_install_hooks_creates_entries(tmp_path: Path):
-    """install_hooks adds both SessionStart and PreCompact entries."""
+    """install_hooks adds SessionStart, UserPromptSubmit, and PreCompact entries."""
     settings_path = tmp_path / "settings.json"
     settings_path.write_text("{}")
     hooks_dir = _fake_hooks_dir(tmp_path)
@@ -68,12 +68,16 @@ def test_install_hooks_creates_entries(tmp_path: Path):
         added = install_hooks()
 
     assert "SessionStart" in added
+    assert "UserPromptSubmit" in added
     assert "PreCompact" in added
     settings = json.loads(settings_path.read_text())
     assert "hooks" in settings
     assert (
         len(settings["hooks"]["SessionStart"]) == 2
     )  # session_start + session_retrieve
+    assert (
+        len(settings["hooks"]["UserPromptSubmit"]) == 1
+    )  # first_prompt_retrieve (is-408 fallback)
     assert len(settings["hooks"]["PreCompact"]) == 1
 
 
@@ -95,6 +99,7 @@ def test_install_hooks_idempotent(tmp_path: Path):
     assert (
         len(settings["hooks"]["SessionStart"]) == 2
     )  # session_start + session_retrieve
+    assert len(settings["hooks"]["UserPromptSubmit"]) == 1
     assert len(settings["hooks"]["PreCompact"]) == 1
 
 
@@ -127,6 +132,7 @@ def test_install_hooks_preserves_existing(tmp_path: Path):
     assert (
         len(settings["hooks"]["SessionStart"]) == 2
     )  # session_start + session_retrieve
+    assert len(settings["hooks"]["UserPromptSubmit"]) == 1
     assert len(settings["hooks"]["PreCompact"]) == 1
 
 
@@ -144,6 +150,7 @@ def test_uninstall_hooks_removes_entries(tmp_path: Path):
         removed = uninstall_hooks()
 
     assert "SessionStart" in removed
+    assert "UserPromptSubmit" in removed
     assert "PreCompact" in removed
     settings = json.loads(settings_path.read_text())
     assert "hooks" not in settings
@@ -180,8 +187,10 @@ def test_check_hooks_reports_status(tmp_path: Path):
     assert status["all_scripts_exist"] is True
     assert status["python3_available"] is True
     assert "SessionStart" in status["hooks"]
+    assert "UserPromptSubmit" in status["hooks"]
     assert "PreCompact" in status["hooks"]
     assert status["hooks"]["SessionStart"]["installed"] is False
+    assert status["hooks"]["UserPromptSubmit"]["installed"] is False
     assert status["hooks"]["PreCompact"]["installed"] is False
 
 
