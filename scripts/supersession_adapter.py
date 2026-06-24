@@ -78,6 +78,29 @@ SUPERSEDES_RE = re.compile(r"(?i)\bsupersedes\s*[:=]?\s*(\S+)")
 # A markdown inline link ``[text](target)`` — we want the target.
 MD_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 
+# Fenced (```...```) and inline (`...`) code spans. These hold DOCUMENTATION —
+# a convention ADR / template SHOWS example `Session:` / `Supersedes:` lines in
+# code blocks. Without stripping them, a doc that merely *describes* the format
+# parses as real data and emits FALSE supersession links (observed: the
+# session-of-record ADR's worked example using real slugs created two bogus
+# links). Citations and relations are PLAIN lines by convention, never code, so
+# stripping code loses no real data.
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+# The filename of a (non-artifact) entry template; never parsed as a record.
+_TEMPLATE_NAME = "template.md"
+
+
+def strip_code(text: str) -> str:
+    """Remove fenced + inline code so example lines are not parsed as data (pure).
+
+    Fenced blocks are replaced with their newline count (line boundaries
+    preserved so no two real lines merge); inline spans become a space.
+    """
+    no_fences = _CODE_FENCE_RE.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+    return _INLINE_CODE_RE.sub(" ", no_fences)
+
+
 # The directories a consuming repo keeps decisions / labbook entries in, with
 # the source tag a relation found there is stamped with.
 ARTIFACT_DIRS: tuple[tuple[str, str], ...] = (
@@ -195,7 +218,12 @@ def parse_artifact(path: str, source: str, content: str) -> Artifact:
 
       * ``Superseded by: X`` in artifact A  ⇒  X supersedes A.
       * ``Supersedes: X``    in artifact A  ⇒  A supersedes X.
+
+    Code (fenced + inline) is stripped first so documentation examples — a
+    convention ADR / template showing the format — are not parsed as real
+    citations or relations.
     """
+    content = strip_code(content)
     return Artifact(
         path=path,
         source=source,
@@ -331,6 +359,8 @@ def scan_artifacts(repo_path: Path) -> list[Artifact]:
         if not base.is_dir():
             continue
         for md in sorted(base.rglob("*.md")):
+            if md.name.lower() == _TEMPLATE_NAME:
+                continue  # a template is documentation, not a decision record
             rel = md.relative_to(repo_path).as_posix()
             artifacts.append(
                 parse_artifact(rel, source, md.read_text(encoding="utf-8"))

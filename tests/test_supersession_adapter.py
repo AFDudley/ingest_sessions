@@ -180,3 +180,52 @@ def test_format_dry_run_labels_reverts_inert() -> None:
     assert "SESSION-level supersession links (1)" in out
     assert f"{SESS_NEW} supersedes {SESS_OLD}" in out
     assert "inert: sha not session-mapped" in out
+
+
+# --------------------------------------------------------------------------- #
+# is-565.6b: documentation (code) must NOT be parsed as data
+# --------------------------------------------------------------------------- #
+
+
+def test_fenced_example_is_not_parsed_as_relation_or_citation() -> None:
+    """A convention ADR that SHOWS the format in a code fence is not data.
+
+    Regression for the bug where the session-of-record ADR's worked example
+    (real slugs in a ``` block) emitted false supersession links.
+    """
+    content = (
+        "# How to cite sessions\n\n"
+        f"Session: {SESS_NEW}\n\n"  # the ADR's OWN real citation (plain) — kept
+        "Show the format:\n\n"
+        "```\n"
+        "Supersedes: 2026-01-01-some-other-adr\n"
+        f"Session: {SESS_OLD}\n"
+        "```\n\n"
+        "Inline `Superseded by: 2026-01-01-yet-another` is also an example.\n"
+    )
+    art = adapter.parse_artifact("docs/decisions/howto.md", "adr-supersedes", content)
+    # Only the plain, out-of-code citation survives; the fenced/inline ones don't.
+    assert art.session_ids == (SESS_NEW,)
+    assert art.supersedes == ()
+    assert art.superseded_by == ()
+
+
+def test_strip_code_removes_fenced_and_inline() -> None:
+    text = "a `inline` b\n```\nfenced Session: x\n```\nc"
+    out = adapter.strip_code(text)
+    assert "inline" not in out
+    assert "fenced" not in out
+    assert "a " in out and " b" in out and "c" in out
+
+
+def test_scan_skips_template_files(tmp_path: Path) -> None:
+    dec = tmp_path / "docs" / "decisions"
+    dec.mkdir(parents=True)
+    (dec / "TEMPLATE.md").write_text(
+        f"Session: {SESS_OLD}\nSupersedes: 2026-01-01-x\n", encoding="utf-8"
+    )
+    (dec / "2026-02-02-real.md").write_text(f"Session: {SESS_NEW}\n", encoding="utf-8")
+    arts = adapter.scan_artifacts(tmp_path)
+    paths = {a.path for a in arts}
+    assert "docs/decisions/2026-02-02-real.md" in paths
+    assert "docs/decisions/TEMPLATE.md" not in paths
