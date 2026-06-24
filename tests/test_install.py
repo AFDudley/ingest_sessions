@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from ingest_sessions.install import (
     MCP_SERVER_NAME,
     MCP_URL,
     SERVICE_UNIT,
+    _hook_command,
     _hook_entry,
     _is_our_hook,
     check_hooks,
@@ -33,6 +35,29 @@ def _fake_hooks_dir(tmp_path: Path) -> Path:
     for _event, filename, _timeout in HOOK_DEFS:
         (hooks_dir / filename).write_text("#!/usr/bin/env python3\n")
     return hooks_dir
+
+
+def test_hook_command_uses_sys_executable_module_form(tmp_path: Path):
+    """Generated hook commands use ``sys.executable -m ingest_sessions.hooks.<mod>``.
+
+    Regression for is-dbd: a bare ``python3 <path>.py`` resolves system python3,
+    which cannot import the uv-tool-isolated ingest_sessions package and fails
+    every hook with ModuleNotFoundError. The command MUST run under the installing
+    interpreter via the module form so the package is importable.
+    """
+    for _event, filename, _timeout in HOOK_DEFS:
+        script = tmp_path / "hooks" / filename
+        module_name = Path(filename).stem
+        cmd = _hook_command(script)
+
+        assert cmd == f"{sys.executable} -m ingest_sessions.hooks.{module_name}"
+        # The installing interpreter, not a bare/system python3.
+        assert cmd.startswith(sys.executable + " ")
+        assert " -m ingest_sessions.hooks." in cmd
+        # Must NOT be the old non-portable `python3 <path>.py` form.
+        assert not cmd.startswith("python3 ")
+        assert not cmd.endswith(".py")
+        assert str(script) not in cmd
 
 
 def test_is_our_hook_matches(tmp_path: Path):
@@ -185,7 +210,7 @@ def test_check_hooks_reports_status(tmp_path: Path):
 
     assert status["all_installed"] is False
     assert status["all_scripts_exist"] is True
-    assert status["python3_available"] is True
+    assert status["interpreter"] == sys.executable
     assert "SessionStart" in status["hooks"]
     assert "UserPromptSubmit" in status["hooks"]
     assert "PreCompact" in status["hooks"]

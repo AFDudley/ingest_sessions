@@ -70,8 +70,18 @@ WantedBy=default.target
 
 
 def _hook_command(script_path: Path) -> str:
-    """Build the hook command string pointing to the installed script."""
-    return f"python3 {script_path}"
+    """Build the hook command: run the hook module under the installing interpreter.
+
+    Uses ``sys.executable -m ingest_sessions.hooks.<module>`` (module form) so the
+    hook runs under the SAME interpreter that installed it. ``ingest-sessions-install``
+    is a console script in the uv-tool isolated venv, so ``sys.executable`` IS that
+    venv's python — the only interpreter that can import ``ingest_sessions``. A bare
+    ``python3 <path>`` resolves system python3, which has no access to the uv-tool
+    venv and fails every hook with ``ModuleNotFoundError: No module named
+    ingest_sessions``. See is-dbd.
+    """
+    module_name = script_path.stem
+    return f"{sys.executable} -m ingest_sessions.hooks.{module_name}"
 
 
 def _load_settings() -> dict[str, Any]:
@@ -168,7 +178,6 @@ def check_hooks() -> dict[str, Any]:
     """Check installation status. Returns a status dict."""
     settings = _load_settings()
     hooks_section = settings.get("hooks", {})
-    python3_available = shutil.which("python3") is not None
 
     hook_statuses: dict[str, Any] = {}
     for event_name, script_filename, _timeout in HOOK_DEFS:
@@ -187,7 +196,10 @@ def check_hooks() -> dict[str, Any]:
     return {
         "all_installed": all_installed,
         "all_scripts_exist": all_scripts_exist,
-        "python3_available": python3_available,
+        # The interpreter the installed hooks run under (sys.executable -m ...).
+        # This is the uv-tool venv python that CAN import ingest_sessions —
+        # not system python3, which cannot (is-dbd). Reported for diagnostics.
+        "interpreter": sys.executable,
         "settings_path": str(SETTINGS_PATH),
         "hooks": hook_statuses,
     }
@@ -417,10 +429,6 @@ def cli() -> None:
         print(f"Systemd service installed: {SERVICE_PATH}")
     else:
         print("Systemd service already installed. Ensured running.")
-
-    hook_status = check_hooks()
-    if not hook_status["python3_available"]:
-        print("WARNING: python3 not found in PATH", file=sys.stderr)
 
 
 if __name__ == "__main__":
