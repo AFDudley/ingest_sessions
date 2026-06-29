@@ -139,6 +139,19 @@ All via environment variables:
 | `INGEST_SESSIONS_PROJECTS_DIR` | `~/.claude/projects` |
 | `INGEST_SESSIONS_HISTORY_FILE` | `~/.claude/history.jsonl` |
 | `INGEST_SESSIONS_PORT` | `8741` |
+| `INGEST_SESSIONS_DB_MEMORY_LIMIT` | `4GB` |
+| `INGEST_SESSIONS_DB_THREADS` | `4` |
+| `INGEST_SESSIONS_DB_OP_BUDGET_SEC` | `30` |
+| `INGEST_SESSIONS_DB_WAIT_TIMEOUT_SEC` | `60` |
+
+All database work runs on one thread / one connection / one FIFO queue. The
+last four variables bound that single thread (pebble is-189): the connection is
+opened with a bounded `memory_limit` + `threads` (a no-config connect would
+default memory to ~80% of RAM); each op is interrupted if it exceeds
+`DB_OP_BUDGET_SEC` so a slow op cannot starve ops queued behind it
+(head-of-line blocking); and a submitted op's wait is bounded by
+`DB_WAIT_TIMEOUT_SEC` (which must exceed the op budget) so a stuck op surfaces
+an explicit error instead of hanging forever.
 
 ## Tests
 
