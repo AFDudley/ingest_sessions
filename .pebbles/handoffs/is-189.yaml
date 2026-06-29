@@ -1,0 +1,108 @@
+status: completed
+pebble_id: is-189
+branch: pebble/is-189
+
+commits:
+  - "3b038287c4109005afa1d78fe6e3821647ce0384"
+
+files_changed:
+  - agent_tools/ingest_sessions/src/ingest_sessions/server.py
+  - agent_tools/ingest_sessions/tests/test_db_thread_bounding.py
+  - agent_tools/ingest_sessions/README.md
+
+tests_added:
+  - "agent_tools/ingest_sessions/tests/test_db_thread_bounding.py::test_head_of_line_blocking_is_bounded"
+  - "agent_tools/ingest_sessions/tests/test_db_thread_bounding.py::test_connection_memory_and_threads_are_bounded"
+
+docs_updated:
+  - "agent_tools/ingest_sessions/README.md (Configuration table: 4 new env vars + single-DB-thread bounding note)"
+
+e2e_gate:
+  spec: agent_tools/ingest_sessions/tests/test_db_thread_bounding.py
+  command: "cd agent_tools/ingest_sessions && uv run --extra test pytest tests/test_db_thread_bounding.py -v"
+  result: passed
+  ran_at_sha: "3b038287"
+  mocks_in_path: false
+  passes: 2
+
+verify_transcript:
+  red_before_fix: |
+    On the unmodified worktree (RED — confirms the test gates the bug):
+    FAILED tests/test_db_thread_bounding.py::test_head_of_line_blocking_is_bounded
+      — trivial op starved: heavy op monopolized the DB thread (no per-op interrupt)
+    FAILED tests/test_db_thread_bounding.py::test_connection_memory_and_threads_are_bounded
+      — AssertionError: threads not bounded to env value: 32  (assert 32 == 2)
+    2 failed in 16.55s
+  pytest_outer_loop_green: |
+    cd agent_tools/ingest_sessions && uv run --extra test pytest tests/test_db_thread_bounding.py -v
+    tests/test_db_thread_bounding.py::test_head_of_line_blocking_is_bounded PASSED [ 50%]
+    tests/test_db_thread_bounding.py::test_connection_memory_and_threads_are_bounded PASSED [100%]
+    2 passed in 1.77s
+  pytest_full_suite: |
+    cd agent_tools/ingest_sessions && uv run --extra test pytest
+    288 passed in 76.57s
+  duckdb_mechanism_verification: |
+    Run-before-read (duckdb 1.4.4): DuckDB has NO Postgres-style SET statement_timeout.
+    DuckDBPyConnection.interrupt() called from another thread raises InterruptException
+    in the executing op (~0.5s after a 0.5s timer on a large cross join), and the SAME
+    connection remains usable afterwards (SELECT 1 -> [(1,)]). config={memory_limit,
+    threads} at connect is honoured (current_setting reports 488.2 MiB / 2 for 512MB/2).
+  mypy: |
+    cd agent_tools/ingest_sessions && uv run mypy src/ingest_sessions/server.py tests/test_db_thread_bounding.py
+    Success: no issues found in 2 source files
+  pre_commit: |
+    Final commit 3b038287 — all hooks green (aspergillus/mypy/ruff ratchets Passed,
+    check-subtree-edits Passed with git-subtree-dir trailer, TDD trailer Passed).
+    fixit lint on both changed files: clean (the new helpers add zero ASP findings;
+    pre-existing ASP201/202 in server.py are baseline, not introduced).
+
+cost: "~95k tokens (~$1.40 est.)"
+
+summary: |
+  Pebble is-189: bound the ingest_sessions MCP server's single DB thread so a
+  slow op can no longer starve the FIFO queue (the MCP query-timeout root
+  cause — head-of-line blocking, NOT lock contention) and cap memory so RSS
+  can't grow to ~80% of RAM (the 42GB footprint). Implemented all three
+  in-scope changes; did NOT touch the query(sql)/LIKE->FTS interface (is-f18).
+
+  THREE CHANGES (server.py):
+  1. Per-op interrupt — _db_loop now runs each req.fn(db) via _run_op_with_budget,
+     which arms a threading.Timer that calls db.interrupt() if the op exceeds an
+     env-overridable budget and cancels it on completion. Verified run-before-read
+     against duckdb 1.4.4: there is NO SET statement_timeout; interrupt() from
+     another thread is the supported per-op cancel — it raises InterruptException
+     in the running op, the loop records req.error, the queue drains, and the next
+     (trivial) op runs on the still-usable connection. This is the change that
+     actually unblocks the starved query.
+  2. Bounded connect — _connect_db opens duckdb.connect(path, config={memory_limit,
+     threads}) with conservative env-overridable defaults (4GB / 4) so the no-config
+     ~80%-RAM / all-cores defaults no longer apply.
+  3. Bounded waiter — _db_execute awaits req.done.wait(_db_wait_timeout_sec())
+     (default 60s, deliberately > the op budget) and raises an explicit TimeoutError
+     instead of the old silent infinite req.done.wait().
+
+  Env vars INGEST_SESSIONS_DB_MEMORY_LIMIT / _DB_THREADS / _DB_OP_BUDGET_SEC /
+  _DB_WAIT_TIMEOUT_SEC documented in README Configuration table.
+
+  OUTER LOOP (tests/test_db_thread_bounding.py) drives the real _db_loop /
+  _db_submit machinery (no mocks; module globals reset per test for isolation):
+  a head-of-line test submits a long cross-join then a trivial SELECT 1 and
+  asserts the trivial op completes within a bounded wall-clock (because the long
+  op is interrupted at a 1s budget) plus that the long op surfaced an explicit
+  error; a config test asserts the live connection reports bounded memory_limit
+  + threads. Both RED on unmodified code (head-of-line starved; threads reported
+  32), GREEN after the fix. Full suite 288 passed; mypy clean.
+
+  ATTENTION COORDINATOR — stale task framing corrected (affects integration):
+  the task prompt said agent_tools/ingest_sessions is "a monorepo-only path, NOT
+  an mtm subtree" with "NO git-subtree-dir trailer". That is no longer true:
+  subtrees.tsv (the source of truth) lists `agent_tools/ingest_sessions
+  ingest-sessions` as a subtree (ADR 2026-06-24-agent-tools-subtrees), and the
+  check-subtree-edits hook ENFORCES the trailer — the commit only passed with
+  `git-subtree-dir: agent_tools/ingest_sessions`. Integration therefore needs the
+  subtree round-trip (`scripts/subtree-sync.sh push agent_tools/ingest_sessions`)
+  before the --no-ff merge into main, same as the recent exo-6c4.10 work. This
+  handoff lives inside the subtree's own .pebbles/handoffs/ (the is- tracker) and
+  is committed with the same trailer, matching the established agent_tools pattern.
+
+next_action: "Coordinator: subtree round-trip push agent_tools/ingest_sessions, then --no-ff merge pebble/is-189 into main, then close is-189 with the cost fold."
