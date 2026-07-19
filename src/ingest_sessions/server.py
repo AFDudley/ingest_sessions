@@ -735,6 +735,11 @@ def _db_loop() -> None:
     path = _db_path()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     db = duckdb.connect(path)
+    # Bound the connection.  Unset, DuckDB defaults memory_limit to 80% of system
+    # RAM and threads to the core count; on a large host that let the buffer pool
+    # reach ~84 GiB and spawn ~225 threads (is-cea).
+    db.execute("SET memory_limit='32GB'")
+    db.execute("SET threads='8'")
     try:
         create_tables(db)
         register_functions(db)
