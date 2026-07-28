@@ -114,9 +114,22 @@ def _db_submit(fn: Callable[[duckdb.DuckDBPyConnection], Any]) -> _DbRequest:
 
 
 async def _db_execute(fn: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
-    """Submit work to the database thread and await its completion."""
+    """Submit work to the database thread and await its completion.
+
+    The wait is BOUNDED (env _DB_WAIT_TIMEOUT_SEC): if the op does not complete
+    in time the caller gets an explicit TimeoutError instead of the old silent
+    infinite wait. Each op is independently bounded by the per-op interrupt
+    budget in _db_loop, so the normal failure mode is the op's own interrupt
+    error surfacing well inside this waiter; this timeout only fires when the
+    request is stuck behind a busy queue.
+    """
     req = _db_submit(fn)
-    await asyncio.to_thread(req.done.wait)
+    completed = await asyncio.to_thread(req.done.wait, _db_wait_timeout_sec())
+    if not completed:
+        raise TimeoutError(
+            "database operation exceeded the bounded wait "
+            f"({_db_wait_timeout_sec()}s): the DB thread is busy or over budget"
+        )
     if req.error is not None:
         raise req.error
     return req.result  # type: ignore[return-value]
@@ -146,6 +159,83 @@ def _history_file() -> Path:
     if env:
         return Path(env)
     return Path.home() / ".claude" / "history.jsonl"
+
+
+# --- Single-DB-thread bounding (pebble is-189) -----------------------------
+# The server runs ALL database work on one thread / one connection / one FIFO
+# queue (see _db_loop). Two unbounded behaviours caused MCP query timeouts and
+# a 42GB RSS:
+#   1. an expensive op monopolised the DB thread, starving trivial ops queued
+#      behind it (head-of-line blocking); and
+#   2. the no-config connect let DuckDB default memory_limit to ~80% of RAM and
+#      threads to all cores.
+# These helpers supply env-overridable bounds. DuckDB has NO Postgres-style
+# `SET statement_timeout`; the supported per-op cancel is
+# DuckDBPyConnection.interrupt() called from another thread (see
+# _run_op_with_budget).
+
+
+def _db_memory_limit() -> str:
+    """Bounded DuckDB memory_limit (env INGEST_SESSIONS_DB_MEMORY_LIMIT)."""
+    return os.environ.get("INGEST_SESSIONS_DB_MEMORY_LIMIT", "4GB")
+
+
+def _db_threads() -> int:
+    """Bounded DuckDB thread count (env INGEST_SESSIONS_DB_THREADS)."""
+    return int(os.environ.get("INGEST_SESSIONS_DB_THREADS", "4"))
+
+
+def _db_op_budget_sec() -> float:
+    """Per-op wall-clock budget before interrupt (env _DB_OP_BUDGET_SEC).
+
+    Any single DB op exceeding this is interrupted so it cannot starve the
+    queue. Generous by default — only pathological full scans hit it.
+    """
+    return float(os.environ.get("INGEST_SESSIONS_DB_OP_BUDGET_SEC", "30"))
+
+
+def _db_wait_timeout_sec() -> float:
+    """Bounded wait for a submitted op (env _DB_WAIT_TIMEOUT_SEC).
+
+    Must exceed the per-op budget so an interrupted op surfaces its own error
+    before the waiter gives up; the waiter timeout only fires when an op is
+    genuinely stuck behind a busy queue, turning the old infinite wait into an
+    explicit error.
+    """
+    return float(os.environ.get("INGEST_SESSIONS_DB_WAIT_TIMEOUT_SEC", "60"))
+
+
+def _connect_db(path: str) -> duckdb.DuckDBPyConnection:
+    """Open the single DuckDB connection with bounded memory + threads.
+
+    A no-config connect defaults memory_limit to ~80% of RAM (observed 42GB
+    RSS) and threads to all cores. Both are bounded here and env-overridable.
+    """
+    return duckdb.connect(
+        path,
+        config={"memory_limit": _db_memory_limit(), "threads": _db_threads()},
+    )
+
+
+def _run_op_with_budget(
+    db: duckdb.DuckDBPyConnection,
+    fn: Callable[[duckdb.DuckDBPyConnection], Any],
+    budget_sec: float,
+) -> Any:
+    """Run fn(db), interrupting it if it exceeds budget_sec.
+
+    Arms a timer thread that calls db.interrupt() — DuckDB's only supported
+    cancel — which raises InterruptException in the executing op. The timer is
+    cancelled on normal completion. An interrupted op propagates its error so
+    the DB loop records it and drains to the next request; the connection
+    stays usable for that next op.
+    """
+    timer = threading.Timer(budget_sec, db.interrupt)
+    timer.start()
+    try:
+        return fn(db)
+    finally:
+        timer.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -734,12 +824,8 @@ def _db_loop() -> None:
     """Single database thread.  Owns the connection, drains the queue."""
     path = _db_path()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    db = duckdb.connect(path)
-    # Bound the connection.  Unset, DuckDB defaults memory_limit to 80% of system
-    # RAM and threads to the core count; on a large host that let the buffer pool
-    # reach ~84 GiB and spawn ~225 threads (is-cea).
-    db.execute("SET memory_limit='32GB'")
-    db.execute("SET threads='8'")
+    db = _connect_db(path)
+    budget = _db_op_budget_sec()
     try:
         create_tables(db)
         register_functions(db)
@@ -751,7 +837,9 @@ def _db_loop() -> None:
             if req is None:
                 break
             try:
-                req.result = req.fn(db)
+                # Per-op budget: a long op is interrupted so it cannot starve
+                # the queue (head-of-line blocking — pebble is-189).
+                req.result = _run_op_with_budget(db, req.fn, budget)
             except Exception as exc:
                 req.error = exc
             req.done.set()

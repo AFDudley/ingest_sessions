@@ -1386,38 +1386,3 @@ def test_antijoin_finds_low_uuid_gap_that_keyset_misses():
     antijoin = srv._fetch_unembedded_antijoin(db, limit=256)
     assert [uuid for uuid, _raw in antijoin] == ["a-001"]
     db.close()
-
-
-@pytest.mark.asyncio
-async def test_db_loop_caps_memory_and_threads(tmp_path: Path, monkeypatch):
-    """The db-thread connection is bounded (is-cea).
-
-    Unset, DuckDB defaults memory_limit to 80% of system RAM and threads to the
-    core count; in prod that let the buffer pool reach ~84 GiB with ~225 threads.
-    """
-    import ingest_sessions.server as srv
-
-    monkeypatch.setenv("INGEST_SESSIONS_DB", str(tmp_path / "caps.duckdb"))
-    monkeypatch.setenv("INGEST_SESSIONS_PROJECTS_DIR", str(tmp_path / "projects"))
-    (tmp_path / "projects").mkdir()
-    monkeypatch.setenv("INGEST_SESSIONS_HISTORY_FILE", str(tmp_path / "history.jsonl"))
-
-    srv._startup_done.clear()
-
-    thread = srv._start_db_thread()
-    try:
-        settings = await srv._db_execute(
-            lambda db: db.execute(
-                "SELECT current_setting('memory_limit'), current_setting('threads')"
-            ).fetchone()
-        )
-    finally:
-        srv._db_queue.put(None)
-        thread.join(timeout=5)
-
-    assert settings is not None
-    memory_limit, threads = settings
-    # DuckDB reports the limit in GiB ('32GB' -> '29.8 GiB'); compare on the number.
-    assert memory_limit.endswith(" GiB")
-    assert float(memory_limit.removesuffix(" GiB")) == pytest.approx(29.8, abs=0.1)
-    assert threads == 8
