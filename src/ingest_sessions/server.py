@@ -28,7 +28,13 @@ from typing import Any, Callable, TypeVar
 import duckdb
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import AnyUrl, Resource, TextContent, Tool
+from mcp.types import Resource, TextContent, Tool
+
+# AnyUrl is a pydantic type. mcp re-exported it from `mcp.types` up to 1.x and
+# dropped that re-export in 2.0.0, which broke this import against the version
+# `mcp>=1.0` resolves to today. Import it from its actual home so the pin stays
+# open (pebble is-19e).
+from pydantic import AnyUrl
 from watchdog.events import (
     DirModifiedEvent,
     FileModifiedEvent,

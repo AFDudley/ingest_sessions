@@ -6,7 +6,17 @@ requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.0",
     "fastembed>=0.8.0",
-    "mcp>=1.0",
+    # Upper bound is load-bearing (pebble is-19e): this server is written
+    # against mcp's 1.x low-level API. 2.0.0 both dropped the
+    # `mcp.types.AnyUrl` re-export and removed `Server.list_tools`, so a fresh
+    # resolve under the old open `mcp>=1.0` installed 2.0.0 and the service
+    # crash-looped on import. Porting to the 2.x API is its own change; until
+    # then the bound is what makes an install reproducible.
+    "mcp>=1.0,<2",
+    # Direct: server.py imports AnyUrl from pydantic. It is also a transitive
+    # dep of mcp, but mcp dropped its `mcp.types.AnyUrl` re-export in 2.0.0, so
+    # the import is ours to declare rather than inherit (pebble is-19e).
+    "pydantic>=2",
     "starlette>=0.27",
     "uvicorn>=0.20",
     "watchdog>=4.0",
