@@ -423,7 +423,16 @@ def derive_session_metadata(
 
 
 def _extract_first_prompt(raw_json: str) -> str | None:
-    """Extract the user's first prompt text from a raw record JSON string."""
+    """Extract the user's first prompt text from a raw record JSON string.
+
+    Handles both a plain string ``message.content`` and the list-of-blocks
+    form by reusing ``retrieval._content_to_text`` (the same flattener the
+    lexical/vector retrieval arms already use), so an omp record whose
+    content is a list of blocks is read correctly instead of coming back
+    empty (pebble is-5a7.1).
+    """
+    from ingest_sessions.retrieval import _content_to_text
+
     try:
         record = json.loads(raw_json)
     except json.JSONDecodeError:
@@ -433,10 +442,8 @@ def _extract_first_prompt(raw_json: str) -> str | None:
     msg = record.get("message")
     if not isinstance(msg, dict):
         return None
-    content = msg.get("content")
-    if isinstance(content, str):
-        return content[:500]
-    return None
+    text = _content_to_text(msg.get("content"))
+    return text[:500] if text else None
 
 
 def ingest_session_metadata(
