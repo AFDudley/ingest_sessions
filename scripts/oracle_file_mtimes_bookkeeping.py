@@ -19,8 +19,11 @@ Two independent checks:
    is skipped for this real-corpus half purely to keep runtime bounded over
    thousands of real files; c1-c4 already prove routing correctness on
    synthetic fixtures, so this half only needs to prove file_mtimes
-   COVERAGE isn't lost for either corpus. Judges nothing -- prints one
-   stdout_json object.
+   COVERAGE isn't lost for either corpus. The claude side is checked as an
+   explicit set difference (on-disk paths minus recorded paths), not
+   inferred from two counts, so the field is immune to a same-sized but
+   differently-populated corpus. Judges nothing -- prints one stdout_json
+   object.
 """
 
 from __future__ import annotations
@@ -99,24 +102,22 @@ def _run_real_corpus_check(tmp_path: Path) -> tuple[int, int]:
     db = duckdb.connect(str(tmp_path / "real_corpus.duckdb"))
     create_tables(db)
 
-    for root in (claude_root, omp_root):
-        for path in discover_session_files([root]):
-            changed, _prev_size = file_changed(db, path)
-            if changed:
-                record_file(db, path)
+    claude_on_disk = discover_session_files([claude_root])
+    omp_on_disk = discover_session_files([omp_root])
 
-    claude_paths_recorded = db.execute(
-        "SELECT count(*) FROM file_mtimes WHERE file_path LIKE ?",
-        [f"{claude_root}%"],
-    ).fetchone()
-    omp_paths_recorded = db.execute(
-        "SELECT count(*) FROM file_mtimes WHERE file_path LIKE ?",
-        [f"{omp_root}%"],
-    ).fetchone()
+    for path in (*claude_on_disk, *omp_on_disk):
+        changed, _prev_size = file_changed(db, path)
+        if changed:
+            record_file(db, path)
+
+    recorded_paths = {
+        row[0] for row in db.execute("SELECT file_path FROM file_mtimes").fetchall()
+    }
+    omp_paths_recorded = sum(1 for p in omp_on_disk if str(p) in recorded_paths)
+    claude_missing = [p for p in claude_on_disk if str(p) not in recorded_paths]
     db.close()
 
-    assert claude_paths_recorded is not None and omp_paths_recorded is not None
-    return omp_paths_recorded[0], claude_paths_recorded[0]
+    return omp_paths_recorded, len(claude_missing)
 
 
 def main() -> None:
@@ -128,7 +129,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        omp_paths_recorded, claude_paths_recorded = _run_real_corpus_check(tmp_path)
+        omp_paths_recorded, claude_paths_missing = _run_real_corpus_check(tmp_path)
 
     print(
         json.dumps(
@@ -136,7 +137,7 @@ def main() -> None:
                 "rescan_unchanged_count": rescan_unchanged_count,
                 "after_append_changed_count": after_append_changed_count,
                 "omp_paths_recorded": omp_paths_recorded,
-                "claude_paths_recorded": claude_paths_recorded,
+                "claude_paths_on_disk_missing_from_file_mtimes": claude_paths_missing,
             }
         )
     )
