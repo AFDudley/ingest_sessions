@@ -4,3 +4,10 @@ __pycache__/
 *.duckdb.wal
 .worktrees
 .scratch/
+
+# exophial runtime state (logs, pids, guard.env); config.yaml is committed.
+.exophial/*
+!.exophial/config.yaml
+.desloppify/
+.pebbles/*.lock
+.pebbles/reducer_ledger.jsonl

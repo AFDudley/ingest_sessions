@@ -1,0 +1,69 @@
+# This repo IS its own coordination repo: its in-repo `.pebbles` bus (prefix
+# `is-`) is the work bus and `.worktrees/` under it is where workers land.
+coordination_repo: "/home/rix/code/git_puller/repos/ingest_sessions/ingest_sessions"
+poll_interval: 5
+inspect_interval: 5
+
+dispatcher:
+  # Small: this instance drains hand-scoped `exophial dispatch` runs, not a fleet.
+  max_workers: 2
+  task_timeout: 3600
+
+# Commit-boundary acceptance gate the integrator re-runs in-worktree for pebbles
+# with NO linked spec (a linked spec is graded in-process by spec_oracle.run_spec).
+# This repo's own committed .pre-commit-config.yaml (ruff, ruff-format, mypy,
+# detect-secrets, plus the exophial-owned guards) IS the commit-boundary gate;
+# reuse it rather than inventing a second one.
+gate:
+  command: ["pre-commit", "run", "--all-files"]
+  timeout: 1800
+
+# Where `exophial spec generate` writes unified spec instances (repo-relative).
+spec_dir: "contracts/specs"
+
+# Config-owned model routing for intake spec derivation (worker-model ADR
+# D2/D3). The derivation resolves its model tier + thinking budget from HERE;
+# the engine hardcodes no default and a MISSING section makes `exophial
+# specify`/`error`/`feature` FAIL LOUD (ops/config.py IntakeConfigError).
+# Routine filings route to the cheap tier; high-criticality ones to frontier.
+intake_derivation:
+  tiers:
+    small: "sonnet"
+    frontier: "opus"
+  thinking_budgets:
+    small: 4000
+    frontier: 31999
+  routing:
+    negligible: small
+    marginal: small
+    critical: frontier
+    catastrophic: frontier
+
+# Config-owned worker-model routing (exo-a98 / worker-model ADR D2/D3). At
+# PROVISION/SPAWN the dispatcher reads the pebble's derived difficulty class and
+# sets the worker's model from THIS table — so an autonomous worker NEVER inherits
+# ~/.claude's interactive session default (whatever the operator last picked with
+# `/model`). No model id is hardcoded in engine code: abstract `tiers` map to
+# concrete ids here, and `routing` maps a difficulty class to a tier. The table
+# MUST carry an explicit `default` routing row — a MISSING `worker_model` section
+# or `default` row FAILS LOUD rather than letting the worker inherit. Difficulty
+# banding from V_spec (ADR D1) is not built yet, so every pebble routes `default`
+# today; the extra tiers/rows activate for free once specs commit a difficulty_class.
+worker_model:
+  tiers:
+    default: "sonnet"
+    frontier: "opus"
+  routing:
+    default: default
+
+# The ONE LLM transport this deployment reaches a model through (exo-698c / ADR
+# docs/decisions/2026-07-16-llm-transport-seam.md). Config-selected, fail-loud: a
+# MISSING `llm_transport` row makes the seam raise rather than guess a default, and
+# no call site outside `llm_transport.py` names how to reach a model. The default
+# `claude_cli` backend uses `claude --print` over OAuth (no API key), so Tier-2
+# conflict resolution works on keyless hosts. `anthropic_sdk` is the API-key-gated
+# alternative (it cannot honor a json_schema request — it raises, never degrades).
+llm_transport:
+  backend: claude_cli
+  # model: ""        # optional per-backend model/tier override
+  # executable: ""   # optional claude_cli binary override (default "claude")

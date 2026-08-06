@@ -1,31 +1,55 @@
 repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
-    hooks:
-      - id: check-yaml
-      - id: check-toml
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
-
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.2
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.15.0
-    hooks:
-      - id: mypy
-        additional_dependencies:
-          - duckdb>=1.0
-          - mcp>=1.0
-          - watchdog>=4.0
-          - fastembed>=0.8.0
-          - types-ujson
-
-  - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.5.0
-    hooks:
-      - id: detect-secrets
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v5.0.0
+  hooks:
+  - id: check-yaml
+  - id: check-toml
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.11.2
+  hooks:
+  - id: ruff
+    args:
+    - --fix
+  - id: ruff-format
+- repo: https://github.com/pre-commit/mirrors-mypy
+  rev: v1.15.0
+  hooks:
+  - id: mypy
+    additional_dependencies:
+    - duckdb>=1.0
+    - mcp>=1.0
+    - watchdog>=4.0
+    - fastembed>=0.8.0
+    - types-ujson
+- repo: https://github.com/Yelp/detect-secrets
+  rev: v1.5.0
+  hooks:
+  - id: detect-secrets
+- repo: local
+  hooks:
+  - id: check-subtree-edits
+    name: Subtree-path edits carry a git-subtree-dir trailer
+    entry: exophial-check-subtree-edits
+    language: system
+    stages:
+    - commit-msg
+- repo: local
+  hooks:
+  - id: reroute-main-commit
+    name: Refuse a direct commit on main; reroute it to a worker branch
+    entry: exophial-reroute-main-commit
+    language: system
+    pass_filenames: false
+    always_run: true
+    stages:
+    - pre-commit
+- repo: local
+  hooks:
+  - id: session-trailer
+    name: Stamp every commit with the session that produced it
+    entry: exophial-session-trailer
+    language: system
+    stages:
+    - commit-msg

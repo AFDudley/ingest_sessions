@@ -1,0 +1,200 @@
+{
+  "id": "derived-is-5a7.2",
+  "original_statement": "Request: Ingestion discovers session JSONL files through two hardcoded, single-root,\ntwo-level walks. Collapse them into ONE discovery function that takes a\nconfigured LIST of roots and walks each recursively. That single function is\nthe whole of this pebble; nothing else changes.\n\nToday:\n- server._projects_dir() (server.py:150) returns ONE Path, and the\n  INGEST_SESSIONS_PROJECTS_DIR env var REPLACES that Path rather than adding\n  to it, so pointing it at ~/.omp drops ~/.claude from coverage entirely.\n- The cold scan walks exactly two levels: projects_dir.iterdir() for\n  directories, then proj_dir.glob(\"*.jsonl\") (server.py:291-296). cli.py:116\n  repeats the same two-level walk over cli.resolve_project_dirs (cli.py:81).\n- The live watchdog is already recursive (server.py:900,\n  observer.schedule(..., recursive=True)), so only the COLD path is shallow.\n\nChange: one function that yields every *.jsonl beneath EACH configured root at\nANY depth. Default root list = [~/.claude/projects, ~/.omp/agent/sessions].\nINGEST_SESSIONS_PROJECTS_DIR stays supported and sets the whole list, parsed\nas os.pathsep-separated paths. Both the cold scan and the watchdog take their\nroots from this same list, so the two can never drift apart. Missing roots are\nskipped, not fatal.\n\nMeasured on this machine today: 7,780 files ingested, all under ~/.claude, 0\nunder ~/.omp; 363 *.jsonl exist under ~/.omp and none are ingested; 313 of\nthose 363 sit deeper than two levels, so a two-level walk rooted at\n~/.omp/agent/sessions would find only 50 of 363.\n\nAcceptance: discovery over the default root list yields all 7,780 Claude files\nAND all 363 omp files in one pass; the watchdog observes the same root list the\ncold scan walks; INGEST_SESSIONS_PROJECTS_DIR set to two os.pathsep-separated\npaths yields files from both roots; a configured root that does not exist is\nskipped without raising.\n\nNOTE (appended):\nexophial-domain-lowering: by-construction",
+  "restatement": "The ingestion tool currently discovers session JSONL files through two separate, hardcoded, single-root, two-level directory walks (one in server.py's cold scan, one in cli.py's resolve_project_dirs), and only the live filesystem watcher is recursive. Because the cold scan is shallow, any session files nested more than two levels deep under a configured root are silently never ingested \u2014 measured today, this drops all coverage of the ~/.omp source entirely. The request is to replace both hardcoded walks with a single discovery function that takes a configured list of root directories and recursively finds every *.jsonl file beneath each one, at any depth. The default roots are the Claude sessions folder and the omp sessions folder. The existing INGEST_SESSIONS_PROJECTS_DIR environment variable keeps working, but now sets the entire root list (not just one path) by parsing it as OS-path-separator-joined paths, so it can supply multiple roots at once instead of replacing full coverage with a single path. A root that doesn't exist on disk must be skipped quietly rather than crashing the scan. Both the one-time cold scan and the live watchdog must draw their root list from this same single source, so they can never fall out of sync with each other again.",
+  "restatement_clauses": [
+    {
+      "id": "c1",
+      "text": "Collapse the two hardcoded, single-root, two-level walks into ONE discovery function that takes a configured LIST of roots and walks each recursively, yielding every *.jsonl beneath each configured root at ANY depth."
+    },
+    {
+      "id": "c2",
+      "text": "Default root list = [~/.claude/projects, ~/.omp/agent/sessions]."
+    },
+    {
+      "id": "c3",
+      "text": "INGEST_SESSIONS_PROJECTS_DIR stays supported and sets the whole list, parsed as os.pathsep-separated paths."
+    },
+    {
+      "id": "c4",
+      "text": "Missing roots are skipped, not fatal \u2014 a configured root that does not exist is skipped without raising."
+    },
+    {
+      "id": "c5",
+      "text": "Both the cold scan and the watchdog take their roots from this same list, so the two can never drift apart; the watchdog observes the same root list the cold scan walks."
+    }
+  ],
+  "goal": "Replace the two hardcoded, two-level directory walks with one recursive, multi-root discovery function used identically by both the cold scan and the live watchdog.",
+  "acceptance_criteria": [
+    "Point the discovery step at a folder containing session files nested at several different depths \u2014 including ones four and five folders deep \u2014 and confirm every one of those files is found, not just the ones within the first two folder levels.",
+    "With no environment override set, check that the default list of folders to scan includes both the Claude sessions folder (~/.claude/projects) and the omp sessions folder (~/.omp/agent/sessions).",
+    "Set the INGEST_SESSIONS_PROJECTS_DIR setting to two folder paths separated by the OS path separator, each containing one session file, and confirm session files are found from both folders.",
+    "Point the scan at one real folder and one folder path that does not exist, and confirm the scan completes without an error and still finds the files in the real folder.",
+    "Set up file-change watching on a list of folders and confirm that watching is turned on, recursively, for every folder in that same list \u2014 the same list the one-time scan used."
+  ],
+  "request_clauses": [
+    {
+      "id": "c1",
+      "text": "Point the discovery step at a folder containing session files nested at several different depths \u2014 including ones four and five folders deep \u2014 and confirm every one of those files is found, not just the ones within the first two folder levels."
+    },
+    {
+      "id": "c2",
+      "text": "With no environment override set, check that the default list of folders to scan includes both the Claude sessions folder (~/.claude/projects) and the omp sessions folder (~/.omp/agent/sessions)."
+    },
+    {
+      "id": "c3",
+      "text": "Set the INGEST_SESSIONS_PROJECTS_DIR setting to two folder paths separated by the OS path separator, each containing one session file, and confirm session files are found from both folders."
+    },
+    {
+      "id": "c4",
+      "text": "Point the scan at one real folder and one folder path that does not exist, and confirm the scan completes without an error and still finds the files in the real folder."
+    },
+    {
+      "id": "c5",
+      "text": "Set up file-change watching on a list of folders and confirm that watching is turned on, recursively, for every folder in that same list \u2014 the same list the one-time scan used."
+    }
+  ],
+  "acceptance_tests": [
+    {
+      "type": "behavior",
+      "description": "Point the discovery step at a folder containing session files nested at several different depths \u2014 including ones four and five folders deep \u2014 and confirm every one of those files is found, not just the ones within the first two folder levels.",
+      "proves": "Proves the new discovery function finds session files at any depth under a configured root, not just two levels deep.",
+      "restatement_clause_id": "c1",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/check_recursive_discovery.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "count",
+          "op": "eq",
+          "value": 4
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 30,
+      "clause_id": "c1"
+    },
+    {
+      "type": "behavior",
+      "description": "With no environment override set, check that the default list of folders to scan includes both the Claude sessions folder (~/.claude/projects) and the omp sessions folder (~/.omp/agent/sessions).",
+      "proves": "Proves the default root list covers both known session sources.",
+      "restatement_clause_id": "c2",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/check_default_roots.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "count",
+          "op": "eq",
+          "value": 2
+        },
+        {
+          "observe": "stdout_json",
+          "field": "has_claude",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "has_omp",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 15,
+      "clause_id": "c2"
+    },
+    {
+      "type": "behavior",
+      "description": "Set the INGEST_SESSIONS_PROJECTS_DIR setting to two folder paths separated by the OS path separator, each containing one session file, and confirm session files are found from both folders.",
+      "proves": "Proves the environment variable can supply multiple roots and both are scanned.",
+      "restatement_clause_id": "c3",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/check_env_var_pathsep.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "count",
+          "op": "eq",
+          "value": 2
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 15,
+      "clause_id": "c3"
+    },
+    {
+      "type": "behavior",
+      "description": "Point the scan at one real folder and one folder path that does not exist, and confirm the scan completes without an error and still finds the files in the real folder.",
+      "proves": "Proves a missing configured root is skipped instead of crashing the scan.",
+      "restatement_clause_id": "c4",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/check_missing_root_skipped.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "count",
+          "op": "eq",
+          "value": 1
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 15,
+      "clause_id": "c4"
+    },
+    {
+      "type": "behavior",
+      "description": "Set up file-change watching on a list of folders and confirm that watching is turned on, recursively, for every folder in that same list \u2014 the same list the one-time scan used.",
+      "proves": "Proves the live file watcher and the one-time scan share the same set of folders, so they can't drift apart.",
+      "restatement_clause_id": "c5",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/check_watchdog_roots.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "scheduled_count",
+          "op": "eq",
+          "value": 2
+        },
+        {
+          "observe": "stdout_json",
+          "field": "all_recursive",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 15,
+      "clause_id": "c5"
+    }
+  ],
+  "criticality": "marginal",
+  "verification_level": "bounded_model_check"
+}

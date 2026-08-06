@@ -1,0 +1,466 @@
+{
+  "id": "derived-is-5a7.1",
+  "original_statement": "Request: Request:\n  Add a source adapter for omp (Oh My Pi) session transcripts so ingestion can parse the omp SessionEntry JSONL format into the existing ingest_sessions records/session schema, without forking the schema (one source adapter selected by claude|omp, not a second table). Concretely: (1) treat line 1 of each omp session file as a 'session' HEADER (type:session, version:3, id, cwd, title, parentSession) and consume it as session metadata (id -> session_id, cwd, title) -- never insert the header line itself as a record; (2) parse the remaining lines as the SessionEntry union (message, thinking_level_change, model_change, service_tier_change, compaction, branch_summary, custom, custom_message, label, ttsr_injection, session_init, mode_change, mcp_tool_selection) without assuming every line is a 'message' entry, and skip malformed lines the same way the existing Claude Code path does (no ingestion abort); (3) reconstruct conversation order for a session by walking parentId from the leaf entry (a DAG), NOT by file order -- a branched omp session (where entries fork) must thread correctly by parent linkage, matching buildSessionContext semantics (compaction entries replace history from firstKeptEntryId; branch_summary/custom_message become synthetic messages); (4) map omp's distinct field names onto the existing 6-field record extraction: header id -> session_id, entry id -> record uuid, entry parentId -> parent, and extract message text from message.content[] list items' .text field (the existing extraction, e.g. _extract_first_prompt, only handles a string message.content and returns None for the list form -- this must be fixed for omp); (5) recursively discover subagent sub-session files that live beside their parent as <session>/<AgentId>.jsonl; (6) read the header's version field (v1/v2/v3) and interpret entries according to that schema version. Measured baseline this must fix: running the naive line-by-file-order ingestion over the 363 omp files today produces 92,013 records where the six-field extraction reads fields that don't exist on omp records -- 100% get a surrogate uuid, 0% get parent_uuid populated, and type counts show zero 'user'/'assistant' rows (instead: message 58,021 / custom 30,078 / custom_message 2,007 / model_change 399 / session 363 / title 347 / session_init 271 / thinking_level_change 192). After the adapter, an omp session's session_id, parent linkage, and role/type fields must be populated the way a Claude Code session's are, and the existing retrieve_relevant / query tools must return omp records the same way they already return Claude Code records (no separate query-path change needed once records land correctly in the shared table).\n\nacceptance_criteria:\n- acceptance criteria pending\n\nPoints: 1\n\nNOTE (appended):\nexophial-domain-lowering: by-construction",
+  "restatement": "Build a new source adapter inside ingest_sessions that lets omp (Oh My Pi) session transcripts land in the same records/sessions tables that Claude Code sessions already use, selected by a claude|omp source tag rather than by adding a second table or forking the schema. Concretely: the adapter must treat the first line of every omp session file as a session-level HEADER (carrying type:session, a version number, an id, a cwd, a title, and an optional parentSession) and use it purely as metadata \u2014 mapping its id to the session's session_id \u2014 without ever inserting that header line itself as a data record. Every remaining line must be parsed as one member of the omp SessionEntry union (message, thinking_level_change, model_change, service_tier_change, compaction, branch_summary, custom, custom_message, label, ttsr_injection, session_init, mode_change, mcp_tool_selection) rather than being assumed to always be a chat message, and a line that doesn't parse must be skipped the same non-fatal way the existing Claude Code path already skips malformed lines, never aborting the whole ingest. Because an omp session's entries can branch, the adapter must reconstruct conversation order by walking each entry's parentId back from the newest leaf to the root (a DAG walk), not by trusting the order lines happen to appear in the file, with compaction entries causing everything before their firstKeptEntryId to drop out of the reconstructed history and branch_summary/custom_message entries appearing in that reconstruction as synthetic messages \u2014 matching how Claude Code's own context-building already treats those cases. The adapter must map omp's own field names onto the six columns the existing record extraction already writes: the header's id becomes session_id, each entry's own id becomes the record uuid, each entry's parentId becomes the parent link, and message text must be pulled from message.content when it is a list of content blocks by reading each block's .text field \u2014 fixing the current extraction (e.g. _extract_first_prompt), which only understands a plain string message.content and silently returns nothing for the list form. The adapter must also recursively find subagent transcripts that sit beside their parent session as <session>/<AgentId>.jsonl and ingest those too, and it must read the version field out of each header (v1, v2, or v3) and interpret that file's entries according to the rules for that specific version rather than one hardcoded interpretation. The end result, measured against today's failure, is that a real omp session's session_id, parent linkage, and role/type fields end up populated the way a Claude Code session's already are \u2014 replacing today's naive line-by-file-order ingestion, which over the actual 363 omp files produces 92,013 records where the six-field extraction reads fields that don't exist on omp records: 100% of records get a surrogate uuid, 0% get parent_uuid populated, and the type counts show zero 'user'/'assistant' rows (instead: message 58,021, custom 30,078, custom_message 2,007, model_change 399, session 363, title 347, session_init 271, thinking_level_change 192). Finally, because the omp adapter writes into the same shared tables via the same six-field shape, the existing retrieve_relevant/query tools must return correctly-ingested omp records exactly the way they already return Claude Code records, with no separate query-path code change required.",
+  "restatement_clauses": [
+    {
+      "id": "c1",
+      "text": "One source adapter selected by claude|omp handles omp session files, writing into the existing shared schema \u2014 not forking the schema or adding a second table for omp data."
+    },
+    {
+      "id": "c2",
+      "text": "Treat line 1 of each omp session file as a 'session' HEADER (type:session, version:3, id, cwd, title, parentSession) and consume it as session metadata (id -> session_id, cwd, title) \u2014 never insert the header line itself as a record."
+    },
+    {
+      "id": "c3",
+      "text": "Parse the remaining lines as the SessionEntry union (message, thinking_level_change, model_change, service_tier_change, compaction, branch_summary, custom, custom_message, label, ttsr_injection, session_init, mode_change, mcp_tool_selection) without assuming every line is a 'message' entry, and skip malformed lines the same way the existing Claude Code path does (no ingestion abort)."
+    },
+    {
+      "id": "c4",
+      "text": "Reconstruct conversation order for a session by walking parentId from the leaf entry (a DAG), NOT by file order \u2014 a branched omp session must thread correctly by parent linkage, matching buildSessionContext semantics (compaction entries replace history from firstKeptEntryId; branch_summary/custom_message become synthetic messages)."
+    },
+    {
+      "id": "c5",
+      "text": "Map omp's distinct field names onto the existing 6-field record extraction: header id -> session_id, entry id -> record uuid, entry parentId -> parent, and extract message text from message.content[] list items' .text field, fixing the existing extraction (e.g. _extract_first_prompt) which only handles a string message.content and returns None for the list form."
+    },
+    {
+      "id": "c6",
+      "text": "Recursively discover subagent sub-session files that live beside their parent as <session>/<AgentId>.jsonl."
+    },
+    {
+      "id": "c7",
+      "text": "Read the header's version field (v1/v2/v3) and interpret entries according to that schema version."
+    },
+    {
+      "id": "c8",
+      "text": "Fix the measured baseline: the naive line-by-file-order ingestion over the 363 omp files today produces 92,013 records with 100% surrogate uuid, 0% parent_uuid populated, and zero 'user'/'assistant' type rows (instead message 58,021 / custom 30,078 / custom_message 2,007 / model_change 399 / session 363 / title 347 / session_init 271 / thinking_level_change 192); after the adapter, an omp session's session_id, parent linkage, and role/type fields must be populated the way a Claude Code session's are."
+    },
+    {
+      "id": "c9",
+      "text": "The existing retrieve_relevant / query tools must return omp records the same way they already return Claude Code records, with no separate query-path change needed once records land correctly in the shared table."
+    }
+  ],
+  "goal": "Add a claude|omp source adapter to ingest_sessions so omp session transcripts parse correctly into the existing shared records/sessions schema \u2014 header-as-metadata, full entry-type coverage, parent-DAG conversation ordering, correct field mapping (including list-form message content), subagent-file discovery, and version-aware parsing \u2014 fixing the measured 0%-parent-linkage / 100%-surrogate-uuid / no-user-or-assistant-rows failure of today's naive ingestion, with no separate table and no query-tool changes needed.",
+  "acceptance_criteria": [
+    "Ingest one small Claude-Code-style session file and one small omp-style session file into the same database, then look at what tables exist and where the records ended up. A person should see: still exactly one records table and one sessions table (no new omp-only table appeared), and both sessions' records sitting together in that same shared records table.",
+    "Feed the adapter a two-line omp session file: the first line is the session header (with an id, a cwd, and a title), the second line is one ordinary chat message. After ingestion, exactly one record exists in the database (the message), the header line itself never became a record, and the session's session_id equals the header's id.",
+    "Feed the adapter an omp session file with one line for every kind of entry omp defines (message, thinking_level_change, model_change, service_tier_change, compaction, branch_summary, custom, custom_message, label, ttsr_injection, session_init, mode_change, mcp_tool_selection), plus one deliberately broken line. The run finishes normally instead of stopping partway, the broken line is counted as skipped, and all 13 well-formed entry kinds are recognized rather than being silently treated as unknown.",
+    "Build a small omp session where the entries are written to the file in an order that does NOT match how they actually reply to each other, including a branch point and a compaction entry that points back at an earlier 'first kept' entry. After reconstruction, the conversation order follows the actual reply-to chain (not the order lines appear in the file), everything before the compaction's kept point is dropped from the reconstructed history, and the branch-summary/custom-message entries show up in that reconstruction as regular messages.",
+    "Feed the adapter one omp entry whose message content is a list of separate content blocks (each carrying its own text), not a plain string. After ingestion, the record's session_id comes from the header's id, its uuid comes from the entry's own id, its parent comes from the entry's parentId, and the extracted message text matches the text pulled out of that list of blocks instead of coming back empty.",
+    "Place a subagent transcript file named after its agent id (e.g. <session-folder>/<AgentId>.jsonl) next to its parent omp session file, without telling the ingester about it directly. Running ingestion over the parent session's folder finds that nested subagent file on its own and ingests its records.",
+    "Feed the adapter three separate omp session files whose headers declare version 1, version 2, and version 3. All three ingest successfully, and each one is interpreted using the rules for the version stated in its own header rather than one interpretation being forced onto all three.",
+    "Ingest a representative sample of omp session files covering the entry-type mix the naive approach failed on (message, custom, custom_message, model_change, session_init, thinking_level_change, plus at least one branch). Afterward, most records have a real parent link rather than none, records aren't all falling back to a made-up uuid, and turns that represent a human's or the assistant's message are labeled as such rather than lumped under a generic type the way the unfixed path did.",
+    "After an omp session has been ingested, ask the same relevant-context retrieval tool that already searches Claude Code sessions a question the omp session's content answers. The omp session's content comes back in the results, formatted the same way a Claude Code session's results already are."
+  ],
+  "request_clauses": [
+    {
+      "id": "c1",
+      "text": "Ingest one small Claude-Code-style session file and one small omp-style session file into the same database, then look at what tables exist and where the records ended up. A person should see: still exactly one records table and one sessions table (no new omp-only table appeared), and both sessions' records sitting together in that same shared records table."
+    },
+    {
+      "id": "c2",
+      "text": "Feed the adapter a two-line omp session file: the first line is the session header (with an id, a cwd, and a title), the second line is one ordinary chat message. After ingestion, exactly one record exists in the database (the message), the header line itself never became a record, and the session's session_id equals the header's id."
+    },
+    {
+      "id": "c3",
+      "text": "Feed the adapter an omp session file with one line for every kind of entry omp defines (message, thinking_level_change, model_change, service_tier_change, compaction, branch_summary, custom, custom_message, label, ttsr_injection, session_init, mode_change, mcp_tool_selection), plus one deliberately broken line. The run finishes normally instead of stopping partway, the broken line is counted as skipped, and all 13 well-formed entry kinds are recognized rather than being silently treated as unknown."
+    },
+    {
+      "id": "c4",
+      "text": "Build a small omp session where the entries are written to the file in an order that does NOT match how they actually reply to each other, including a branch point and a compaction entry that points back at an earlier 'first kept' entry. After reconstruction, the conversation order follows the actual reply-to chain (not the order lines appear in the file), everything before the compaction's kept point is dropped from the reconstructed history, and the branch-summary/custom-message entries show up in that reconstruction as regular messages."
+    },
+    {
+      "id": "c5",
+      "text": "Feed the adapter one omp entry whose message content is a list of separate content blocks (each carrying its own text), not a plain string. After ingestion, the record's session_id comes from the header's id, its uuid comes from the entry's own id, its parent comes from the entry's parentId, and the extracted message text matches the text pulled out of that list of blocks instead of coming back empty."
+    },
+    {
+      "id": "c6",
+      "text": "Place a subagent transcript file named after its agent id (e.g. <session-folder>/<AgentId>.jsonl) next to its parent omp session file, without telling the ingester about it directly. Running ingestion over the parent session's folder finds that nested subagent file on its own and ingests its records."
+    },
+    {
+      "id": "c7",
+      "text": "Feed the adapter three separate omp session files whose headers declare version 1, version 2, and version 3. All three ingest successfully, and each one is interpreted using the rules for the version stated in its own header rather than one interpretation being forced onto all three."
+    },
+    {
+      "id": "c8",
+      "text": "Ingest a representative sample of omp session files covering the entry-type mix the naive approach failed on (message, custom, custom_message, model_change, session_init, thinking_level_change, plus at least one branch). Afterward, most records have a real parent link rather than none, records aren't all falling back to a made-up uuid, and turns that represent a human's or the assistant's message are labeled as such rather than lumped under a generic type the way the unfixed path did."
+    },
+    {
+      "id": "c9",
+      "text": "After an omp session has been ingested, ask the same relevant-context retrieval tool that already searches Claude Code sessions a question the omp session's content answers. The omp session's content comes back in the results, formatted the same way a Claude Code session's results already are."
+    }
+  ],
+  "acceptance_tests": [
+    {
+      "description": "Ingest one small Claude-Code-style session file and one small omp-style session file into the same database, then look at what tables exist and where the records ended up. A person should see: still exactly one records table and one sessions table (no new omp-only table appeared), and both sessions' records sitting together in that same shared records table.",
+      "proves": "the omp adapter is selected by source rather than by forking the schema or standing up a second table",
+      "restatement_clause_id": "c1",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_shared_schema.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "records_table_count",
+          "op": "eq",
+          "value": 1
+        },
+        {
+          "observe": "stdout_json",
+          "field": "sessions_table_count",
+          "op": "eq",
+          "value": 1
+        },
+        {
+          "observe": "stdout_json",
+          "field": "claude_and_omp_records_share_table",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 60,
+      "clause_id": "c1"
+    },
+    {
+      "description": "Feed the adapter a two-line omp session file: the first line is the session header (with an id, a cwd, and a title), the second line is one ordinary chat message. After ingestion, exactly one record exists in the database (the message), the header line itself never became a record, and the session's session_id equals the header's id.",
+      "proves": "the omp header line is consumed as session metadata rather than being inserted as a data record, and its id becomes the session identifier",
+      "restatement_clause_id": "c2",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_header.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "record_count",
+          "op": "eq",
+          "value": 1
+        },
+        {
+          "observe": "stdout_json",
+          "field": "header_inserted_as_record",
+          "op": "eq",
+          "value": false
+        },
+        {
+          "observe": "stdout_json",
+          "field": "session_id_from_header_id",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 30,
+      "clause_id": "c2"
+    },
+    {
+      "description": "Feed the adapter an omp session file with one line for every kind of entry omp defines (message, thinking_level_change, model_change, service_tier_change, compaction, branch_summary, custom, custom_message, label, ttsr_injection, session_init, mode_change, mcp_tool_selection), plus one deliberately broken line. The run finishes normally instead of stopping partway, the broken line is counted as skipped, and all 13 well-formed entry kinds are recognized rather than being silently treated as unknown.",
+      "proves": "every omp entry kind is parsed as its own type instead of being assumed to be a chat message, and a malformed line is skipped without aborting ingestion, matching the existing Claude Code behavior",
+      "restatement_clause_id": "c3",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_entry_union.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "ingestion_aborted",
+          "op": "eq",
+          "value": false
+        },
+        {
+          "observe": "stdout_json",
+          "field": "malformed_lines_skipped",
+          "op": "ge",
+          "value": 1
+        },
+        {
+          "observe": "stdout_json",
+          "field": "recognized_entry_kind_count",
+          "op": "eq",
+          "value": 13
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 30,
+      "clause_id": "c3"
+    },
+    {
+      "description": "Build a small omp session where the entries are written to the file in an order that does NOT match how they actually reply to each other, including a branch point and a compaction entry that points back at an earlier 'first kept' entry. After reconstruction, the conversation order follows the actual reply-to chain (not the order lines appear in the file), everything before the compaction's kept point is dropped from the reconstructed history, and the branch-summary/custom-message entries show up in that reconstruction as regular messages.",
+      "proves": "conversation order for a branched omp session is rebuilt by following parent links back from the latest entry, not by trusting file order, and compaction/branch-summary/custom-message entries are handled the way Claude Code sessions already handle them",
+      "restatement_clause_id": "c4",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_dag_order.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "reconstructed_order_matches_parent_chain",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "reconstructed_order_matches_file_order",
+          "op": "eq",
+          "value": false
+        },
+        {
+          "observe": "stdout_json",
+          "field": "history_before_first_kept_entry_dropped",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "branch_summary_and_custom_message_present_as_messages",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 60,
+      "clause_id": "c4"
+    },
+    {
+      "description": "Feed the adapter one omp entry whose message content is a list of separate content blocks (each carrying its own text), not a plain string. After ingestion, the record's session_id comes from the header's id, its uuid comes from the entry's own id, its parent comes from the entry's parentId, and the extracted message text matches the text pulled out of that list of blocks instead of coming back empty.",
+      "proves": "omp's field names are mapped onto the existing session_id/uuid/parent columns, and the text-extraction that used to return nothing for list-form message content now reads the text out of each block",
+      "restatement_clause_id": "c5",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_field_mapping.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "session_id_from_header_id",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "uuid_from_entry_id",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "parent_from_parent_id",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "list_content_text_extracted",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 30,
+      "clause_id": "c5"
+    },
+    {
+      "description": "Place a subagent transcript file named after its agent id (e.g. <session-folder>/<AgentId>.jsonl) next to its parent omp session file, without telling the ingester about it directly. Running ingestion over the parent session's folder finds that nested subagent file on its own and ingests its records.",
+      "proves": "subagent sub-session files sitting beside their parent session are discovered and ingested automatically",
+      "restatement_clause_id": "c6",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_subagent_discovery.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "subagent_file_discovered",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "subagent_records_ingested",
+          "op": "ge",
+          "value": 1
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 30,
+      "clause_id": "c6"
+    },
+    {
+      "description": "Feed the adapter three separate omp session files whose headers declare version 1, version 2, and version 3. All three ingest successfully, and each one is interpreted using the rules for the version stated in its own header rather than one interpretation being forced onto all three.",
+      "proves": "the header's version field is read and used to pick how that file's entries are interpreted",
+      "restatement_clause_id": "c7",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_version_dispatch.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "v1_parsed_with_v1_rules",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "v2_parsed_with_v2_rules",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "v3_parsed_with_v3_rules",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 45,
+      "clause_id": "c7"
+    },
+    {
+      "description": "Ingest a representative sample of omp session files covering the entry-type mix the naive approach failed on (message, custom, custom_message, model_change, session_init, thinking_level_change, plus at least one branch). Afterward, most records have a real parent link rather than none, records aren't all falling back to a made-up uuid, and turns that represent a human's or the assistant's message are labeled as such rather than lumped under a generic type the way the unfixed path did.",
+      "proves": "the fix actually reverses the measured baseline failure (100% surrogate uuid, 0% parent_uuid populated, zero user/assistant-labeled rows) rather than merely parsing without crashing",
+      "restatement_clause_id": "c8",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_baseline_outcome.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "percent_records_with_surrogate_uuid",
+          "op": "lt",
+          "value": 100
+        },
+        {
+          "observe": "stdout_json",
+          "field": "percent_records_with_parent_populated",
+          "op": "gt",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "role_typed_record_count",
+          "op": "gt",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 60,
+      "clause_id": "c8"
+    },
+    {
+      "description": "After an omp session has been ingested, ask the same relevant-context retrieval tool that already searches Claude Code sessions a question the omp session's content answers. The omp session's content comes back in the results, formatted the same way a Claude Code session's results already are.",
+      "proves": "omp records surface through the existing retrieve_relevant/query tools the same way Claude Code records already do, with no separate query-path change required",
+      "restatement_clause_id": "c9",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_query_parity.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "omp_record_returned_by_retrieve_relevant",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "result_shape_matches_claude_session_result",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 120,
+      "clause_id": "c9"
+    }
+  ],
+  "criticality": "marginal",
+  "verification_level": "bounded_model_check"
+}
