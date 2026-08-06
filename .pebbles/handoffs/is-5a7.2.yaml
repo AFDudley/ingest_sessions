@@ -1,0 +1,223 @@
+status: completed
+pebble_id: is-5a7.2
+branch: worker/is-5a7-2
+
+commits:
+  - "6a38c8e"
+  - "a2e10c5"
+
+files_changed:
+  - src/ingest_sessions/core.py
+  - src/ingest_sessions/server.py
+  - src/ingest_sessions/cli.py
+  - scripts/check_recursive_discovery.py
+  - scripts/check_default_roots.py
+  - scripts/check_env_var_pathsep.py
+  - scripts/check_missing_root_skipped.py
+  - scripts/check_watchdog_roots.py
+  - scripts/check_cli_recursive_discovery.py
+
+tests_added:
+  - scripts/check_recursive_discovery.py
+  - scripts/check_default_roots.py
+  - scripts/check_env_var_pathsep.py
+  - scripts/check_missing_root_skipped.py
+  - scripts/check_watchdog_roots.py
+  - scripts/check_cli_recursive_discovery.py
+
+e2e_gate:
+  spec: contracts/specs/derived-is-5a7.2.spec.json
+  command: "source .venv/bin/activate && python3 scripts/check_recursive_discovery.py && python3 scripts/check_default_roots.py && python3 scripts/check_env_var_pathsep.py && python3 scripts/check_missing_root_skipped.py && python3 scripts/check_watchdog_roots.py"
+  result: passed
+  ran_at_sha: "a2e10c5"
+  mocks_in_path: false
+
+discrimination:
+  - mechanism: ablation
+    oracle: scripts/check_watchdog_roots.py
+    target: src/ingest_sessions/server.py
+    perturbation: >-
+      In a throwaway copy of the tree, replaced server.py with the pre-work
+      (base 9c2961c) version: removed _discovery_roots()/_schedule_watches()
+      and reverted _start_watcher() to schedule a single recursive watch on
+      the single _projects_dir() Path, withholding the shared multi-root
+      watchdog wiring this pebble adds.
+    took:
+      applied:
+        observable: "text at server.py's watcher functions (_schedule_watches / _start_watcher), re-read from the throwaway file after writing"
+        moved:
+          - "def _schedule_watches(observer, roots): watches=[observer.schedule(_JsonlHandler(), str(root), recursive=True) for root in roots (each mkdir'd first)]; def _start_watcher(): observer=Observer(); _schedule_watches(observer, _discovery_roots()); ..."
+          - "def _start_watcher(): projects_dir=_projects_dir(); projects_dir.mkdir(...); observer=Observer(); observer.schedule(_JsonlHandler(), str(projects_dir), recursive=True); ... (no _schedule_watches, no _discovery_roots, single root)"
+      observed:
+        observable: "check_watchdog_roots.py outcome (stdout_json on success, exception on failure), run via PYTHONPATH pointed at the throwaway src/"
+        moved:
+          - '{"scheduled_count": 2, "all_recursive": true}'
+          - "AttributeError: module 'ingest_sessions.server' has no attribute '_schedule_watches'"
+    assertions_fired:
+      - assertion: "server._schedule_watches(observer, roots) exists and schedules one recursive watch per configured root (scheduled_count == len(roots) == 2, all_recursive == True)"
+        moved:
+          - "scheduled_count=2, all_recursive=True (exit 0)"
+          - "AttributeError: no attribute '_schedule_watches' (exit 1)"
+    pinned_at:
+      - scripts/check_watchdog_roots.py
+    exit_code_before: 0
+    exit_code_after: 1
+    reverted: throwaway_tree_discarded
+
+  - mechanism: ablation
+    oracle: scripts/check_cli_recursive_discovery.py
+    target: src/ingest_sessions/cli.py
+    perturbation: >-
+      In the same throwaway copy, replaced cli.py's ingest() line
+      `jsonl_files = discover_session_files([proj_dir])` with the pre-work
+      (base 9c2961c) `jsonl_files = sorted(proj_dir.glob("*.jsonl"))` — the
+      hardcoded two-level, non-recursive walk — withholding the shared
+      discovery fix from the CLI path.
+    took:
+      applied:
+        observable: "text at cli.py's ingest(), the jsonl_files assignment line, re-read from the throwaway file after writing"
+        moved:
+          - "jsonl_files = discover_session_files([proj_dir])"
+          - 'jsonl_files = sorted(proj_dir.glob("*.jsonl"))'
+      observed:
+        observable: "check_cli_recursive_discovery.py stdout_json.sessions_found, run via PYTHONPATH pointed at the throwaway src/"
+        moved:
+          - "1"
+          - "0"
+    assertions_fired:
+      - assertion: "sessions_found == 1 (a *.jsonl nested three levels below the named project dir, via cli.ingest() -> discover_session_files, is found)"
+        moved:
+          - "1"
+          - "0"
+    pinned_at:
+      - scripts/check_cli_recursive_discovery.py
+    exit_code_before: 0
+    exit_code_after: 0
+    reverted: throwaway_tree_discarded
+
+verify_transcript:
+  red_before_fix: |
+    All 5 original spec oracles run against the unmodified base tree
+    (9c2961c), before core.discover_session_files / resolve_discovery_roots
+    / server._schedule_watches existed:
+    check_recursive_discovery.py: ImportError: cannot import name
+      'discover_session_files' from 'ingest_sessions.core'
+    check_default_roots.py: ImportError: cannot import name
+      'resolve_discovery_roots' from 'ingest_sessions.core'
+    check_env_var_pathsep.py: ImportError: cannot import name
+      'discover_session_files' from 'ingest_sessions.core'
+    check_missing_root_skipped.py: ImportError: cannot import name
+      'discover_session_files' from 'ingest_sessions.core'
+    check_watchdog_roots.py: AttributeError: module 'ingest_sessions.server'
+      has no attribute '_schedule_watches'
+    All 5 exited non-zero.
+  oracle_scripts_green_at_a2e10c5: |
+    python3 scripts/check_recursive_discovery.py
+    {"count": 4}
+    python3 scripts/check_default_roots.py
+    {"count": 2, "has_claude": true, "has_omp": true}
+    python3 scripts/check_env_var_pathsep.py
+    {"count": 2}
+    python3 scripts/check_missing_root_skipped.py
+    {"count": 1}
+    python3 scripts/check_watchdog_roots.py
+    {"scheduled_count": 2, "all_recursive": true}
+    python3 scripts/check_cli_recursive_discovery.py
+    {"sessions_found": 1}
+    All 6 exited 0 — matches expected values for c1-c5 exactly, plus the
+    cli.py discrimination oracle.
+  ablation_server_py: |
+    Throwaway copy of the tree at commit a2e10c5, server.py replaced with
+    `git show 9c2961c:src/ingest_sessions/server.py`, re-read after write to
+    confirm _projects_dir()/single-root _start_watcher() were really back
+    (no _schedule_watches, no _discovery_roots). Ran via
+    PYTHONPATH=<throwaway>/src (the venv's editable .pth points at THIS
+    tree's src, so PYTHONPATH override is required for the throwaway copy
+    to actually be exercised — verified with
+    `python3 -c "import ingest_sessions.cli as cli; print(cli.__file__)"`
+    resolving to the throwaway path before running the oracle):
+      check_watchdog_roots.py -> AttributeError: module
+        'ingest_sessions.server' has no attribute '_schedule_watches' (exit 1)
+      check_default_roots.py -> {"count": 2, "has_claude": true,
+        "has_omp": true} (exit 0, UNCHANGED — vacuity finding: this oracle
+        calls core.resolve_discovery_roots() directly and never touches
+        server.py at all, so ablating server.py cannot move it; it is not
+        used as server.py discrimination evidence)
+    Throwaway tree then rm -rf'd.
+  ablation_cli_py: |
+    Same throwaway copy, cli.py replaced with
+    `git show 9c2961c:src/ingest_sessions/cli.py`, re-read after write to
+    confirm the two-level `proj_dir.glob("*.jsonl")` walk was really back.
+    Ran via the same PYTHONPATH override:
+      check_cli_recursive_discovery.py -> {"sessions_found": 0} (exit 0) —
+        moved from {"sessions_found": 1} on the real branch.
+    Throwaway tree then rm -rf'd.
+  pytest_full_suite: |
+    uv run --extra test pytest -q
+    ........................................................................ [ 25%]
+    ........................................................................ [ 50%]
+    ........................................................................ [ 75%]
+    ........................................................................ [100%]
+    288 passed in 75.77s (0:01:15)
+  mypy: |
+    uv run mypy src/ingest_sessions/core.py src/ingest_sessions/server.py src/ingest_sessions/cli.py
+    Success: no issues found in 3 source files
+    (scripts/check_*.py verified via `pre-commit run mypy --files ...`,
+    which passed — running plain `uv run mypy scripts/x.py` in isolation
+    hits an unrelated import-untyped note because that invocation lacks the
+    editable-install context pre-commit's hook has; pre-existing for every
+    committed check_*.py script, not a regression.)
+  ruff: |
+    uv run ruff check src/ingest_sessions/core.py src/ingest_sessions/server.py src/ingest_sessions/cli.py scripts/check_*.py
+    All checks passed!
+    uv run ruff format --check ...
+    files already formatted
+  pre_commit: |
+    Commit 6a38c8e and commit a2e10c5 — all hooks green: check-yaml/toml
+    (skipped, no matching files), end-of-file-fixer, trailing-whitespace,
+    ruff, ruff-format, mypy, detect-secrets, reroute-main-commit,
+    check-subtree-edits, session-trailer all Passed on both commits.
+
+cost: "~160k tokens"
+
+summary: |
+  Collapsed the two hardcoded, shallow directory walks (server.py's cold
+  scan: projects_dir.iterdir() + proj_dir.glob("*.jsonl"); cli.py's batch
+  ingester: the same glob per resolved project dir) into one recursive,
+  multi-root discovery function shared by every caller. Added
+  core.discover_session_files(roots) (recursive rglob per root, skips a
+  missing root instead of raising) and core.resolve_discovery_roots
+  (env_value) (parses INGEST_SESSIONS_PROJECTS_DIR as os.pathsep-separated
+  paths into the WHOLE root list, replacing the old single-Path env var
+  that dropped ~/.claude coverage whenever set, defaulting to
+  [~/.claude/projects, ~/.omp/agent/sessions]). server._discovery_roots()
+  is the single call site both _ingest_all (cold scan) and the new
+  server._schedule_watches/_start_watcher (watchdog) draw from. cli.py's
+  per-project-dir walk now calls the same discover_session_files() instead
+  of its own glob.
+
+  Verified outside-in: authored the 5 acceptance oracle scripts named by
+  the linked spec FIRST, observed all 5 fail against the unmodified base
+  tree at 9c2961c, implemented, then got exactly the spec's expected
+  stdout_json values for every clause at 6a38c8e. Full pytest suite (288),
+  mypy, ruff, pre-commit all clean.
+
+  DISCRIMINATION (second pass, after the integrator parked the first
+  handoff): cli.py and server.py are both wired gates in this repo
+  (pyproject [project.scripts] console-script targets), so each needed an
+  executed ablation proof. server.py: check_watchdog_roots.py (the only one
+  of the 5 spec oracles that actually calls into server.py) killed cleanly
+  — scheduled_count/all_recursive -> AttributeError when server.py was
+  reverted to its pre-work single-root wiring in a throwaway tree.
+  check_default_roots.py was ALSO re-run against the ablated server.py per
+  the resume instructions but did NOT move (it calls
+  core.resolve_discovery_roots() directly and never touches server.py) —
+  recorded here as an honest vacuity finding, not used as evidence.
+  cli.py had no covering oracle at all among the original 5 (none of them
+  exercise cli.py), so scripts/check_cli_recursive_discovery.py was
+  authored and committed (a2e10c5): it drives the real cli.ingest() over a
+  synthetic ~/.claude/projects/<name>/a/b/c/session.jsonl tree and killed
+  cleanly under ablation (sessions_found 1 -> 0) when cli.py was reverted
+  to its pre-work proj_dir.glob("*.jsonl") two-level walk. Both throwaway
+  trees were rm -rf'd after use; the proofs are pinned to the two committed
+  oracle scripts, which re-run the ablated-vs-real contrast on demand.
