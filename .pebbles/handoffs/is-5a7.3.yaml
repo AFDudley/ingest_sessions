@@ -1,0 +1,225 @@
+status: completed
+pebble_id: is-5a7.3
+branch: worker/is-5a7-3
+
+commits:
+  - "ab8ac2b"
+  - "c8194b1"
+  - "8fee661"
+
+files_changed:
+  - scripts/oracle_file_mtimes_bookkeeping.py
+  - scripts/oracle_probe_content_based.py
+  - scripts/oracle_router_exactly_once.py
+  - scripts/oracle_session_id_provenance.py
+  - scripts/oracle_shared_routing_three_call_sites.py
+  - src/ingest_sessions/cli.py
+  - src/ingest_sessions/core.py
+  - src/ingest_sessions/server.py
+
+tests_added:
+  - scripts/oracle_probe_content_based.py
+  - scripts/oracle_shared_routing_three_call_sites.py
+  - scripts/oracle_router_exactly_once.py
+  - scripts/oracle_session_id_provenance.py
+  - scripts/oracle_file_mtimes_bookkeeping.py
+
+summary: >-
+  Wired the already-built omp adapter into all three ingest call sites via one
+  shared, content-based router: core.probe_session_format classifies a file as
+  omp|claude from ONLY its first line (a type=="session" header with a
+  non-empty id is omp; anything else is claude — never a path check), and
+  core.ingest_routed_file is the single place cli.ingest, server._ingest_all
+  and server._ingest_file_full all call instead of unconditionally calling
+  core.ingest_jsonl. The router calls omp.ingest_omp_jsonl directly (never
+  omp.ingest_omp_session, which would re-trigger discover_subagent_files' own
+  fan-out and double-insert a subagent transcript's rows once discovery's
+  recursive walk also hands that subagent file over as its own path); every
+  omp file's session_id — parent or subagent — comes from that file's own
+  header id via ingest_omp_session_metadata, never the filename stem.
+  file_mtimes bookkeeping (file_changed/record_file) wraps the router
+  identically for both formats. This resumes two prior blocked attempts on
+  this pebble: the routing implementation itself (recovered from wip/is-5a7-3,
+  cherry-picked in as ab8ac2b) was already correct on both prior passes and is
+  unchanged here. What was still wrong was scripts/oracle_file_mtimes_bookkeeping.py's
+  real-corpus half (c5): its first correction (c8194b1, cherry-picked from the
+  same recovered work) emitted claude coverage as an explicit set difference
+  instead of a frozen 7,779-file floor, but it still resolved the real
+  ~/.claude and ~/.omp roots via core.default_discovery_roots() -> Path.home(),
+  and the acceptance grader pins HOME to a fresh empty scratch directory per
+  grading pass — so the prior gate run measured two empty roots and reported a
+  vacuous 0-missing-of-0-present pass (omp_paths_recorded=0 alongside
+  claude_paths_on_disk_missing_from_file_mtimes=0), while a direct shell run
+  returned the real 323/0. Fixed in 8fee661: the oracle's real-corpus check now
+  resolves the invoking user's actual home via
+  pwd.getpwuid(os.getuid()).pw_dir — never $HOME, never Path.home() — and
+  additionally emits claude_paths_on_disk_count so an empty/near-empty root
+  fails the new >=100 predicate loudly instead of the set-difference check
+  passing vacuously. Product code (core.default_discovery_roots()) is
+  unchanged; only the acceptance probe needed the passwd entry, because only
+  the probe runs under a sandboxed HOME. Verified by running all 5 spec
+  oracles directly (not simulated) at HEAD: c1 classifies a relocated
+  omp-shaped sample as omp and a claude-shaped sample sitting in an
+  omp-looking path as claude; c2 shows zero surrogate uuids and a real
+  first_prompt through all three call sites (parent_uuid_nonnull_rate 0.875
+  >= 0.85); c3 shows a subagent file ingested exactly once (3 rows, not 6);
+  c4 shows the subagent's session_id comes from its own header, never the
+  parent's id or the filename stem; c5 shows idempotent re-scans,
+  append-detection, 323 real omp paths recorded (>=300), 3,848 real
+  ~/.claude/projects *.jsonl files on disk (>=100), and zero of those missing
+  from file_mtimes. The full unit suite (322 tests) passes. Two ablation
+  discrimination proofs (below) were re-executed fresh at this branch's HEAD
+  — not copied from a prior pass — confirming server.py and cli.py, both
+  wired-gate console-script modules per completion._console_script_paths,
+  actually carry the routing decision: reverting either one alone in an
+  isolated throwaway copy of the tree reproduces the pre-fix surrogate-uuid
+  symptom at exactly the call site(s) that were reverted, and nowhere else.
+
+cost: "~55k tokens"
+
+verify_transcript:
+  pytest: |
+    uv run --extra test pytest -q
+    ........................................................................ [ 22%]
+    ........................................................................ [ 44%]
+    ........................................................................ [ 67%]
+    ........................................................................ [ 89%]
+    ..................................                                       [100%]
+    322 passed in 73.90s
+  pre_commit: |
+    uv run pre-commit run --files scripts/oracle_file_mtimes_bookkeeping.py \
+      scripts/oracle_probe_content_based.py scripts/oracle_router_exactly_once.py \
+      scripts/oracle_session_id_provenance.py scripts/oracle_shared_routing_three_call_sites.py \
+      src/ingest_sessions/core.py src/ingest_sessions/server.py src/ingest_sessions/cli.py
+    check yaml......................................................(no files to check)Skipped
+    check toml......................................................(no files to check)Skipped
+    fix end of files....................................................................Passed
+    trim trailing whitespace............................................................Passed
+    ruff................................................................................Passed
+    ruff-format..........................................................................Passed
+    mypy.................................................................................Passed
+    Detect secrets.......................................................................Passed
+    Refuse a direct commit on main; reroute it to a worker branch.......................Passed
+  oracle_c1_probe_content_based: |
+    {"relocated_omp_sample_classification": "omp", "claude_shaped_in_omp_path_classification": "claude"}
+  oracle_c2_shared_routing_three_call_sites: |
+    {"cli_ingest_surrogate_uuid_count": 0, "ingest_all_surrogate_uuid_count": 0, "ingest_file_full_surrogate_uuid_count": 0, "parent_uuid_nonnull_rate": 0.875, "session_row_first_prompt_nonnull": true}
+  oracle_c3_router_exactly_once: |
+    {"subagent_row_count": 3}
+  oracle_c4_session_id_provenance: |
+    {"subagent_session_id_matches_own_header": true, "subagent_session_id_matches_filename_stem": false, "subagent_session_id_matches_parent_id": false}
+  oracle_c5_file_mtimes_bookkeeping: |
+    {"rescan_unchanged_count": 0, "after_append_changed_count": 1, "omp_paths_recorded": 323, "claude_paths_on_disk_count": 3848, "claude_paths_on_disk_missing_from_file_mtimes": 0}
+  ablation_server_py: |
+    Re-executed at this branch's HEAD (8fee661), not copied from a prior pass.
+    Isolated throwaway copy (git archive HEAD into .scratch/ablation_server,
+    discarded after the run): server.py replaced with
+    `git show cde08a7:src/ingest_sessions/server.py` (cli.py and core.py left
+    at HEAD). Re-read after write to confirm _ingest_file_full/_ingest_all
+    were really back to calling core.ingest_jsonl unconditionally
+    (grep -c ingest_routed_file -> 0 in the throwaway server.py). PYTHONPATH
+    override confirmed to actually be exercised
+    (uv run python3 -c "import ingest_sessions.server as s; print(s.__file__)"
+    resolved to the throwaway path). Ran oracle_shared_routing_three_call_sites.py
+    against the throwaway tree (PYTHONPATH=.scratch/ablation_server/src:src):
+      {"cli_ingest_surrogate_uuid_count": 0, "ingest_all_surrogate_uuid_count": 9,
+       "ingest_file_full_surrogate_uuid_count": 9, "parent_uuid_nonnull_rate": 0.0,
+       "session_row_first_prompt_nonnull": false}
+    cli_ingest_surrogate_uuid_count stayed 0 (untouched call site — vacuity
+    control confirming the perturbation was isolated to server.py). Throwaway
+    tree then rm -rf'd.
+  ablation_cli_py: |
+    Re-executed at this branch's HEAD (8fee661), not copied from a prior pass.
+    Same isolated-copy technique, separate throwaway (.scratch/ablation_cli,
+    discarded after the run): cli.py replaced with
+    `git show cde08a7:src/ingest_sessions/cli.py` (server.py and core.py left
+    at HEAD). Re-read after write to confirm ingest() was really back to
+    `session_id = jsonl_path.stem; count, _ = ingest_jsonl(db, jsonl_path)`
+    (grep -n confirmed jsonl_path.stem present, ingest_routed_file absent, in
+    the throwaway cli.py). Ran oracle_shared_routing_three_call_sites.py via
+    the same PYTHONPATH override (.scratch/ablation_cli/src:src):
+      {"cli_ingest_surrogate_uuid_count": 9, "ingest_all_surrogate_uuid_count": 0,
+       "ingest_file_full_surrogate_uuid_count": 0, "parent_uuid_nonnull_rate": 0.0,
+       "session_row_first_prompt_nonnull": false}
+    ingest_all/ingest_file_full_surrogate_uuid_count stayed 0 — vacuity
+    control confirming the perturbation was isolated to cli.py. Throwaway
+    tree then rm -rf'd.
+
+e2e_gate:
+  spec: contracts/specs/derived-is-5a7.3.spec.json
+  command: >-
+    uv run python3 scripts/oracle_probe_content_based.py &&
+    uv run python3 scripts/oracle_shared_routing_three_call_sites.py &&
+    uv run python3 scripts/oracle_router_exactly_once.py &&
+    uv run python3 scripts/oracle_session_id_provenance.py &&
+    uv run python3 scripts/oracle_file_mtimes_bookkeeping.py
+  result: passed
+  ran_at_sha: "8fee661"
+  mocks_in_path: false
+
+discrimination:
+  - mechanism: ablation
+    oracle: scripts/oracle_shared_routing_three_call_sites.py
+    target: src/ingest_sessions/server.py
+    perturbation: >-
+      In an isolated throwaway copy of the tree, replaced server.py's
+      _ingest_file_full and _ingest_all with the pre-work (base cde08a7)
+      versions, which call core.ingest_jsonl unconditionally instead of
+      core.ingest_routed_file — withholding server.py's half of the shared
+      routing decision while leaving cli.py and core.py at HEAD.
+    took:
+      applied:
+        observable: "text at server.py's _ingest_file_full/_ingest_all ingest call, re-read from the throwaway file after writing"
+        moved:
+          - "count, bytes_read, fmt = ingest_routed_file(db, jsonl_path, byte_offset=prev_size, blob_root=blob_dir()); ... _, bytes_read, fmt = ingest_routed_file(db, jsonl_path, byte_offset=prev_size, blob_root=_blob_root)"
+          - "session_id = jsonl_path.stem; count, bytes_read = ingest_jsonl(db, jsonl_path, byte_offset=prev_size, blob_root=blob_dir()); ... session_id = jsonl_path.stem; _, bytes_read = ingest_jsonl(db, jsonl_path, byte_offset=prev_size, blob_root=_blob_root)"
+      observed:
+        observable: "oracle_shared_routing_three_call_sites.py stdout_json.ingest_file_full_surrogate_uuid_count, run via PYTHONPATH pointed at the throwaway src/"
+        moved:
+          - "0"
+          - "9"
+    assertions_fired:
+      - assertion: "ingest_all_surrogate_uuid_count == 0 (server._ingest_all routes the omp sample through omp.ingest_omp_jsonl, producing no surrogate uuid)"
+        moved:
+          - "0"
+          - "9"
+      - assertion: "ingest_file_full_surrogate_uuid_count == 0 (server._ingest_file_full routes the omp sample through omp.ingest_omp_jsonl)"
+        moved:
+          - "0"
+          - "9"
+    pinned_at:
+      - scripts/oracle_shared_routing_three_call_sites.py
+    exit_code_before: 0
+    exit_code_after: 0
+    reverted: throwaway_tree_discarded
+
+  - mechanism: ablation
+    oracle: scripts/oracle_shared_routing_three_call_sites.py
+    target: src/ingest_sessions/cli.py
+    perturbation: >-
+      In a separate isolated throwaway copy of the tree, replaced cli.py's
+      ingest() omp/claude dispatch with the pre-work (base cde08a7) version,
+      which calls core.ingest_jsonl unconditionally instead of
+      core.ingest_routed_file — withholding cli.py's half of the shared
+      routing decision while leaving server.py and core.py at HEAD.
+    took:
+      applied:
+        observable: "text at cli.py's ingest() call, re-read from the throwaway file after writing"
+        moved:
+          - "count, _, fmt = ingest_routed_file(db, jsonl_path)"
+          - "session_id = jsonl_path.stem; count, _ = ingest_jsonl(db, jsonl_path)"
+      observed:
+        observable: "oracle_shared_routing_three_call_sites.py stdout_json.cli_ingest_surrogate_uuid_count, run via PYTHONPATH pointed at the throwaway src/"
+        moved:
+          - "0"
+          - "9"
+    assertions_fired:
+      - assertion: "cli_ingest_surrogate_uuid_count == 0 (cli.ingest routes the omp sample through omp.ingest_omp_jsonl via ingest_routed_file)"
+        moved:
+          - "0"
+          - "9"
+    pinned_at:
+      - scripts/oracle_shared_routing_three_call_sites.py
+    exit_code_before: 0
+    exit_code_after: 0
+    reverted: throwaway_tree_discarded
