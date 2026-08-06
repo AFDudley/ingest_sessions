@@ -1,0 +1,551 @@
+{
+  "id": "derived-is-5a7.4",
+  "original_statement": "Request: The landed omp adapter requires the `session` header to be LINE 0. On the real\ncorpus it almost never is, so 307 of 323 omp files are silently classified\n`claude` and ingested through the wrong parser.\n\nMeasured 2026-08-06 against ~/.omp/agent/sessions (323 *.jsonl on disk), using\nthe landed code:\n\n  probe_session_format:  {'claude': 307, 'omp': 16}\n  first-line type:       {'title': 307, 'session': 16}\n  session-header index:  {0: 16, 1: 307}\n  files with a session header in their first two lines: 323 / 323\n\nA real file begins:\n\n  line 0  {\"type\":\"title\",\"v\":1,\"title\":\"Pull from remote\",\"source\":\"auto\",\n           \"updatedAt\":\"...\",\"pad\":\"                      ...   \"}\n  line 1  {\"type\":\"session\",\"version\":3,\"id\":\"019fa9bd-f2b3-7000-aa10-...\",\n           \"cwd\":\"/home/rix/code/git_puller/repos/ingest_sessions\",\n           \"title\":\"Pull from remote\"}\n  line 2  {\"type\":\"model_change\",\"id\":\"f3b29721\",\"parentId\":null,...}\n\nThe `title` line is a fixed-width, rewritten-in-place record (note its `pad`\nfield) that omp keeps at the head of the file so the title can be updated\nwithout rewriting the whole transcript. It is a preamble line, not a\nSessionEntry: it carries no `id` and no `parentId`, so it can never be a DAG\nnode.\n\nA full-corpus rehearsal into a throwaway DuckDB (never the live one) confirms\nthe consequence: 323 omp paths recorded in file_mtimes but only 201 records\nand 16 session rows, because only the 16 header-at-line-0 files reached the\nomp adapter. The other 307 went down core.ingest_jsonl.\n\nChange, in src/ingest_sessions/omp.py and whatever core.probe_session_format\nneeds to follow:\n\n- Locate the session header by SCANNING the leading lines for the first\n  object whose type == \"session\" with a non-empty id, instead of requiring\n  index 0. Bound the scan to a small fixed number of leading lines (2 covers\n  every file on disk today; keep the bound small so a Claude Code transcript\n  is never re-classified as omp by a `session`-shaped line deep in the file).\n- probe_session_format must use the SAME bounded scan, so classification and\n  ingestion can never disagree about whether a file is omp.\n- Every line at or before the header index is session-level PREAMBLE:\n  consumed for metadata where it has any, never inserted as a record, never\n  counted as malformed. The `title` preamble line's title is the same string\n  the header already carries, so the header stays the metadata authority.\n- Lines after the header index parse as the SessionEntry union exactly as\n  they do today. Nothing about DAG threading, versioning, subagent handling\n  or field mapping changes.\n\nAcceptance, measured against a THROWAWAY DuckDB cold-scanned over the two real\ndefault roots resolved from the invoking user's passwd entry\n(pwd.getpwuid(os.getuid()).pw_dir), never the live corpus and never $HOME\n(the acceptance grader pins HOME to an empty scratch dir):\n\n- probe_session_format classifies at least 320 of the ~323 files under\n  <real-home>/.omp/agent/sessions as \"omp\"; the count classified \"claude\"\n  is 0.\n- Records attributed to omp session ids number in the tens of thousands, not\n  hundreds: at least 50,000.\n- Session rows for omp session ids number at least 300, not 16.\n- No omp record carries a surrogate `nouuid_...` uuid.\n- parent_uuid is non-null for at least 85% of omp records.\n- No `title` preamble line is inserted as a record, and no `title` preamble\n  line is counted in malformed_lines.",
+  "restatement": "The part of this tool that reads omp agent transcripts currently insists that a file's session header be the very first line. On the real corpus that is almost never true. omp writes a fixed-width, rewritten-in-place `title` record at the head of each transcript (it carries a `pad` field) so a session's title can be updated without rewriting the whole file; the real session header sits on the line after it. Because of the first-line rule, 307 of the 323 transcripts on disk are labelled as Claude Code transcripts and pushed through the wrong reader. A full rehearsal into a scratch database confirms the damage: 323 omp files are recorded as seen, but only 201 records and 16 sessions come out, because only the 16 files that happen to start with the header ever reached the omp reader.\n\nWhat is being asked for: stop requiring the header at line 0. Instead, scan a small, fixed number of leading lines and take the first object whose type is \"session\" and whose id is non-empty as the header. The bound must stay small \u2014 2 lines covers every file on disk today \u2014 precisely so that a `session`-shaped line buried deep inside a Claude Code transcript can never cause that transcript to be mistaken for an omp one. The routine that decides which reader a file belongs to must use the exact same bounded scan as the reader itself, so the two can never disagree about what a file is.\n\nEverything at or before the header line is session-level preamble: it may be read for metadata, but it is never turned into a record and never counted as a malformed line. The `title` preamble line carries the same title string the header already carries, so the header remains the single authority for session metadata. Everything after the header line is read exactly as it is read today \u2014 nothing about conversation threading, versioning, subagent handling or field mapping changes.\n\nThe result is judged by rebuilding into a throwaway database (never the live one), cold-scanning the two real default corpus roots resolved from the invoking user's account entry rather than from the HOME environment variable, which the grader deliberately points at an empty scratch directory. On that rebuild: at least 320 of the ~323 files under the real home's omp sessions directory are classified omp and zero are classified Claude; at least 50,000 records and at least 300 sessions are attributed to omp session ids; no omp record carries a made-up `nouuid_...` identifier; at least 85% of omp records have a non-empty parent link; and no `title` preamble line appears as a record or in the malformed-line count.",
+  "restatement_clauses": [
+    {
+      "id": "C1",
+      "text": "The session header is found by SCANNING the leading lines for the first object whose type == \"session\" with a non-empty id, instead of requiring index 0; on the real corpus the header is at index 1 for 307 files and at index 0 for 16, and all 323 files have a session header within their first two lines."
+    },
+    {
+      "id": "C2",
+      "text": "Bound the scan to a small fixed number of leading lines (2 covers every file on disk today), so a Claude Code transcript is never re-classified as omp by a `session`-shaped line deep in the file."
+    },
+    {
+      "id": "C3",
+      "text": "The routine that decides a file's format uses the SAME bounded scan as the omp reader, so classification and ingestion can never disagree about whether a file is omp."
+    },
+    {
+      "id": "C4",
+      "text": "Every line at or before the header index is session-level PREAMBLE: never inserted as a record and never counted in malformed_lines \u2014 in particular no `title` preamble line is inserted as a record and none is counted in malformed_lines."
+    },
+    {
+      "id": "C5",
+      "text": "Preamble is consumed for metadata where it has any, but the header stays the metadata authority: the `title` preamble line's title is the same string the header already carries, so session titles come from the header."
+    },
+    {
+      "id": "C6",
+      "text": "Lines after the header index parse as the SessionEntry union exactly as they do today; nothing about DAG threading, versioning, subagent handling or field mapping changes."
+    },
+    {
+      "id": "C7",
+      "text": "Measured on a throwaway DuckDB cold-scanned over the two real default roots resolved from the invoking user's passwd entry (pwd.getpwuid(os.getuid()).pw_dir), never the live corpus and never $HOME, which the grader pins to an empty scratch dir."
+    },
+    {
+      "id": "C8",
+      "text": "probe_session_format classifies at least 320 of the ~323 files under <real-home>/.omp/agent/sessions as \"omp\", and the count classified \"claude\" is 0."
+    },
+    {
+      "id": "C9",
+      "text": "Records attributed to omp session ids number at least 50,000 (tens of thousands, not hundreds)."
+    },
+    {
+      "id": "C10",
+      "text": "Session rows for omp session ids number at least 300, not 16."
+    },
+    {
+      "id": "C11",
+      "text": "No omp record carries a surrogate `nouuid_...` uuid."
+    },
+    {
+      "id": "C12",
+      "text": "parent_uuid is non-null for at least 85% of omp records."
+    }
+  ],
+  "goal": "Find the omp session header by a bounded scan of a file's leading lines \u2014 shared by classification and by ingestion \u2014 so all ~323 omp transcripts are read by the omp reader instead of 307 of them silently going through the Claude Code reader.",
+  "acceptance_criteria": [
+    "Across the real collection of ~323 omp transcript files, the tool reports finding a session header in at least 320 of them, and reports that for at least 300 of those files the header was NOT the first line \u2014 showing it no longer insists the header come first. The deepest header it had to look at is no further than the second line.",
+    "A made-up Claude Code transcript that has a session-looking line buried ten lines down is still reported as a Claude transcript, not an omp one, and every real Claude transcript in the collection is likewise still reported as Claude. The tool reports that it only ever looks at the first two lines when deciding.",
+    "For every one of the ~323 real omp files, the answer to \"is this an omp file?\" given by the format-deciding step matches the answer given by the omp reader itself. The number of files where the two answers differ is zero.",
+    "After rebuilding the whole collection into a scratch database, the report shows that hundreds of `title` preamble lines were seen, that none of them became a stored entry, and that none of them was counted as a broken line.",
+    "For every omp session stored in the scratch rebuild, the session's title is the one carried by the session header line of its file. The number of sessions whose stored title came from anywhere other than the header is zero.",
+    "Take a transcript whose header already sits on the very first line, read it, then read a copy of the same transcript with a title preamble line glued on top. Both readings produce the same entries, in the same order, with the same identities, parents, kinds and content \u2014 and the same count of broken lines.",
+    "With the HOME setting pointing at an empty scratch folder, the check still reports finding at least 320 omp transcripts, reports that it located them via the invoking user's account record rather than that setting, and reports that it never opened the live collection database.",
+    "Asking the tool what kind of file each of the ~323 transcripts in the user's omp sessions folder is, at least 320 come back as omp and exactly zero come back as Claude.",
+    "After a fresh rebuild of the whole collection into a scratch database, the number of stored entries belonging to omp sessions is at least 50,000 \u2014 tens of thousands, not the 201 the broken version produced.",
+    "The same scratch rebuild shows at least 300 stored omp sessions, rather than the 16 the broken version produced.",
+    "Scanning every stored omp entry in the scratch rebuild, not a single one has an invented placeholder identifier beginning with `nouuid_`.",
+    "In the scratch rebuild, at least 85 out of every 100 stored omp entries record which earlier entry they follow from."
+  ],
+  "request_clauses": [
+    {
+      "id": "c1",
+      "text": "Across the real collection of ~323 omp transcript files, the tool reports finding a session header in at least 320 of them, and reports that for at least 300 of those files the header was NOT the first line \u2014 showing it no longer insists the header come first. The deepest header it had to look at is no further than the second line."
+    },
+    {
+      "id": "c2",
+      "text": "A made-up Claude Code transcript that has a session-looking line buried ten lines down is still reported as a Claude transcript, not an omp one, and every real Claude transcript in the collection is likewise still reported as Claude. The tool reports that it only ever looks at the first two lines when deciding."
+    },
+    {
+      "id": "c3",
+      "text": "For every one of the ~323 real omp files, the answer to \"is this an omp file?\" given by the format-deciding step matches the answer given by the omp reader itself. The number of files where the two answers differ is zero."
+    },
+    {
+      "id": "c4",
+      "text": "After rebuilding the whole collection into a scratch database, the report shows that hundreds of `title` preamble lines were seen, that none of them became a stored entry, and that none of them was counted as a broken line."
+    },
+    {
+      "id": "c5",
+      "text": "For every omp session stored in the scratch rebuild, the session's title is the one carried by the session header line of its file. The number of sessions whose stored title came from anywhere other than the header is zero."
+    },
+    {
+      "id": "c6",
+      "text": "Take a transcript whose header already sits on the very first line, read it, then read a copy of the same transcript with a title preamble line glued on top. Both readings produce the same entries, in the same order, with the same identities, parents, kinds and content \u2014 and the same count of broken lines."
+    },
+    {
+      "id": "c7",
+      "text": "With the HOME setting pointing at an empty scratch folder, the check still reports finding at least 320 omp transcripts, reports that it located them via the invoking user's account record rather than that setting, and reports that it never opened the live collection database."
+    },
+    {
+      "id": "c8",
+      "text": "Asking the tool what kind of file each of the ~323 transcripts in the user's omp sessions folder is, at least 320 come back as omp and exactly zero come back as Claude."
+    },
+    {
+      "id": "c9",
+      "text": "After a fresh rebuild of the whole collection into a scratch database, the number of stored entries belonging to omp sessions is at least 50,000 \u2014 tens of thousands, not the 201 the broken version produced."
+    },
+    {
+      "id": "c10",
+      "text": "The same scratch rebuild shows at least 300 stored omp sessions, rather than the 16 the broken version produced."
+    },
+    {
+      "id": "c11",
+      "text": "Scanning every stored omp entry in the scratch rebuild, not a single one has an invented placeholder identifier beginning with `nouuid_`."
+    },
+    {
+      "id": "c12",
+      "text": "In the scratch rebuild, at least 85 out of every 100 stored omp entries record which earlier entry they follow from."
+    }
+  ],
+  "acceptance_tests": [
+    {
+      "description": "Across the real collection of ~323 omp transcript files, the tool reports finding a session header in at least 320 of them, and reports that for at least 300 of those files the header was NOT the first line \u2014 showing it no longer insists the header come first. The deepest header it had to look at is no further than the second line.",
+      "proves": "Proves the header is found by looking through the opening lines for the first genuine session record with a real id, rather than demanding it be line one \u2014 the core of the fix.",
+      "restatement_clause_id": "C1",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_header_scan.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "files_total",
+          "op": "ge",
+          "value": 320
+        },
+        {
+          "observe": "stdout_json",
+          "field": "files_with_header_found",
+          "op": "ge",
+          "value": 320
+        },
+        {
+          "observe": "stdout_json",
+          "field": "headers_at_index_gt_zero",
+          "op": "ge",
+          "value": 300
+        },
+        {
+          "observe": "stdout_json",
+          "field": "max_header_index",
+          "op": "le",
+          "value": 1
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 600,
+      "clause_id": "c1"
+    },
+    {
+      "description": "A made-up Claude Code transcript that has a session-looking line buried ten lines down is still reported as a Claude transcript, not an omp one, and every real Claude transcript in the collection is likewise still reported as Claude. The tool reports that it only ever looks at the first two lines when deciding.",
+      "proves": "Proves the search for the header stays confined to the top of the file, so a deeply buried session-shaped line can never drag a Claude Code transcript into the omp reader.",
+      "restatement_clause_id": "C2",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_scan_bound.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "scan_bound",
+          "op": "le",
+          "value": 2
+        },
+        {
+          "observe": "stdout_json",
+          "field": "deep_session_line_index",
+          "op": "ge",
+          "value": 5
+        },
+        {
+          "observe": "stdout_json",
+          "field": "synthetic_deep_session_classified_omp",
+          "op": "eq",
+          "value": false
+        },
+        {
+          "observe": "stdout_json",
+          "field": "real_claude_files_classified_omp",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 600,
+      "clause_id": "c2"
+    },
+    {
+      "description": "For every one of the ~323 real omp files, the answer to \"is this an omp file?\" given by the format-deciding step matches the answer given by the omp reader itself. The number of files where the two answers differ is zero.",
+      "proves": "Proves the two places that ask whether a file is omp use one and the same search, so a file can never be labelled one way and read another.",
+      "restatement_clause_id": "C3",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_probe_agreement.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "files_total",
+          "op": "ge",
+          "value": 320
+        },
+        {
+          "observe": "stdout_json",
+          "field": "disagreements",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 600,
+      "clause_id": "c3"
+    },
+    {
+      "description": "After rebuilding the whole collection into a scratch database, the report shows that hundreds of `title` preamble lines were seen, that none of them became a stored entry, and that none of them was counted as a broken line.",
+      "proves": "Proves the fixed-width title line at the head of each transcript is treated as session-level preamble \u2014 skipped cleanly rather than stored as content or blamed as corruption.",
+      "restatement_clause_id": "C4",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_rehearsal.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "preamble_lines_total",
+          "op": "ge",
+          "value": 300
+        },
+        {
+          "observe": "stdout_json",
+          "field": "preamble_lines_inserted_as_records",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "preamble_lines_counted_malformed",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 1800,
+      "clause_id": "c4"
+    },
+    {
+      "description": "For every omp session stored in the scratch rebuild, the session's title is the one carried by the session header line of its file. The number of sessions whose stored title came from anywhere other than the header is zero.",
+      "proves": "Proves the preamble does not become a competing source of session information \u2014 the header remains the single authority for a session's details.",
+      "restatement_clause_id": "C5",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_rehearsal.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "omp_session_rows",
+          "op": "ge",
+          "value": 300
+        },
+        {
+          "observe": "stdout_json",
+          "field": "sessions_with_title_not_from_header",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 1800,
+      "clause_id": "c5"
+    },
+    {
+      "description": "Take a transcript whose header already sits on the very first line, read it, then read a copy of the same transcript with a title preamble line glued on top. Both readings produce the same entries, in the same order, with the same identities, parents, kinds and content \u2014 and the same count of broken lines.",
+      "proves": "Proves that adding the preamble changes nothing about how the rest of the file is understood, so conversation threading, versioning, subagent handling and field mapping behave exactly as before.",
+      "restatement_clause_id": "C6",
+      "type": "metamorphic",
+      "relation_class": "conservation",
+      "run": [
+        "python3",
+        "scripts/oracle_omp_preamble_invariance.py"
+      ],
+      "clause_id": "c6"
+    },
+    {
+      "description": "With the HOME setting pointing at an empty scratch folder, the check still reports finding at least 320 omp transcripts, reports that it located them via the invoking user's account record rather than that setting, and reports that it never opened the live collection database.",
+      "proves": "Proves the whole result is measured against the user's real transcript folders using a disposable database, so the live collection is never read from or written to during grading.",
+      "restatement_clause_id": "C7",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_roots_from_passwd.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "resolved_from_passwd",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "files_found_under_scan_root",
+          "op": "ge",
+          "value": 320
+        },
+        {
+          "observe": "stdout_json",
+          "field": "live_db_opened",
+          "op": "eq",
+          "value": false
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 600,
+      "clause_id": "c7"
+    },
+    {
+      "description": "Asking the tool what kind of file each of the ~323 transcripts in the user's omp sessions folder is, at least 320 come back as omp and exactly zero come back as Claude.",
+      "proves": "Proves the misclassification is gone: essentially the whole collection is now recognised as omp instead of 307 of them being mistaken for Claude transcripts.",
+      "restatement_clause_id": "C8",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_classification.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "files_total",
+          "op": "ge",
+          "value": 320
+        },
+        {
+          "observe": "stdout_json",
+          "field": "omp_classified",
+          "op": "ge",
+          "value": 320
+        },
+        {
+          "observe": "stdout_json",
+          "field": "claude_classified",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 600,
+      "clause_id": "c8"
+    },
+    {
+      "description": "After a fresh rebuild of the whole collection into a scratch database, the number of stored entries belonging to omp sessions is at least 50,000 \u2014 tens of thousands, not the 201 the broken version produced.",
+      "proves": "Proves the content of the transcripts actually arrives in the collection now, instead of being dropped on the floor by the wrong reader.",
+      "restatement_clause_id": "C9",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_rehearsal.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "omp_records",
+          "op": "ge",
+          "value": 50000
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 1800,
+      "clause_id": "c9"
+    },
+    {
+      "description": "The same scratch rebuild shows at least 300 stored omp sessions, rather than the 16 the broken version produced.",
+      "proves": "Proves nearly every transcript on disk now becomes a searchable session, not just the handful that happened to start with their header.",
+      "restatement_clause_id": "C10",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_rehearsal.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "omp_session_rows",
+          "op": "ge",
+          "value": 300
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 1800,
+      "clause_id": "c10"
+    },
+    {
+      "description": "Scanning every stored omp entry in the scratch rebuild, not a single one has an invented placeholder identifier beginning with `nouuid_`.",
+      "proves": "Proves entries keep their own real identifiers rather than being given made-up ones, which is what happens when a file is read by the wrong reader.",
+      "restatement_clause_id": "C11",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_rehearsal.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "omp_records",
+          "op": "ge",
+          "value": 50000
+        },
+        {
+          "observe": "stdout_json",
+          "field": "records_with_surrogate_uuid",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 1800,
+      "clause_id": "c11"
+    },
+    {
+      "description": "In the scratch rebuild, at least 85 out of every 100 stored omp entries record which earlier entry they follow from.",
+      "proves": "Proves the conversation structure survives the read, so entries can be traced back through the exchange they belong to instead of sitting orphaned.",
+      "restatement_clause_id": "C12",
+      "type": "behavior",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_omp_rehearsal.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "omp_records",
+          "op": "ge",
+          "value": 50000
+        },
+        {
+          "observe": "stdout_json",
+          "field": "parent_uuid_non_null_pct",
+          "op": "ge",
+          "value": 85
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 1800,
+      "clause_id": "c12"
+    }
+  ],
+  "criticality": "marginal",
+  "verification_level": "bounded_model_check"
+}
