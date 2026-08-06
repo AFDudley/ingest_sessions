@@ -198,8 +198,8 @@
     {
       "type": "behavior",
       "restatement_clause_id": "c5_file_mtimes",
-      "description": "First, a small synthetic folder of omp files is cold-scanned twice in a row with nothing changed in between (reporting whether the second scan found anything to re-read), then one file is appended to and scanned a third time (reporting whether that file was picked up as changed). Second, the two real session folders (~/.claude/projects and ~/.omp/agent/sessions) are cold-scanned into a disposable, throwaway database -- never the live one -- and the check reports how many omp paths ended up recorded and how many claude *.jsonl files present ON DISK AT SCAN TIME were NOT recorded.",
-      "proves": "Proves omp files are tracked for re-scan and change-detection exactly as claude files always have been (idempotent re-scans, appends detected), and that adding omp coverage costs the claude corpus nothing: the omp folder's roughly 363 files show up substantially in full (not stuck at 50), and EVERY claude *.jsonl on disk at scan time is recorded -- zero missing. The claude side is stated as exact coverage of the live on-disk population rather than as a frozen floor because Claude Code runs its own session-retention cleanup against ~/.claude/projects (~/.claude/.last-cleanup); one ran at 2026-08-06T15:50:45.747Z and pruned that tree from 7,780 *.jsonl to 3,844, so a frozen floor grades the retention job rather than this change. Exact coverage is strictly stronger: it cannot be satisfied by a corpus that merely happens to be large.",
+      "description": "First, a small synthetic folder of omp files is cold-scanned twice in a row with nothing changed in between (reporting whether the second scan found anything to re-read), then one file is appended to and scanned a third time (reporting whether that file was picked up as changed). Second, the two real session folders (<real-home>/.claude/projects and <real-home>/.omp/agent/sessions) are cold-scanned into a disposable, throwaway database -- never the live one -- and the check reports how many omp paths ended up recorded, how many claude *.jsonl files were on disk at scan time, and how many of those were NOT recorded. The real home directory MUST be resolved from the invoking user's passwd entry (pwd.getpwuid(os.getuid()).pw_dir), NOT from $HOME and NOT from Path.home(): the acceptance grader deliberately pins HOME to a fresh empty scratch directory for every grading pass (spec_oracle _construct_oracle_child_env), so an oracle reading $HOME finds two empty roots and reports 0 files missing out of 0 files present -- a vacuous pass. That is what happened on the 2026-08-06 16:35 grading run, which returned omp_paths_recorded=0 alongside claude_paths_on_disk_missing_from_file_mtimes=0 while a direct run in the operator's own shell returned 323 and 0.",
+      "proves": "Proves omp files are tracked for re-scan and change-detection exactly as claude files always have been (idempotent re-scans, appends detected), and that adding omp coverage costs the claude corpus nothing: the omp folder's roughly 363 files show up substantially in full (not stuck at 50), a non-trivial claude population is actually present at scan time (>= 100, closing the empty-roots vacuity), and EVERY claude *.jsonl on disk at scan time is recorded -- zero missing. Claude coverage is stated as exact coverage of the live on-disk population rather than as a frozen floor because Claude Code runs its own session-retention cleanup against ~/.claude/projects (~/.claude/.last-cleanup); one ran at 2026-08-06T15:50:45.747Z and pruned that tree from 7,780 *.jsonl to 3,844, so a frozen floor grades the retention job rather than this change.",
       "when": {
         "interpreter": "python3",
         "script": "scripts/oracle_file_mtimes_bookkeeping.py",
@@ -224,6 +224,12 @@
           "field": "omp_paths_recorded",
           "op": "ge",
           "value": 300
+        },
+        {
+          "observe": "stdout_json",
+          "field": "claude_paths_on_disk_count",
+          "op": "ge",
+          "value": 100
         },
         {
           "observe": "stdout_json",
