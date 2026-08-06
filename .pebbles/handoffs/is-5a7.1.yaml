@@ -1,0 +1,162 @@
+status: completed
+pebble_id: is-5a7.1
+branch: worker/is-5a7-1
+
+commits:
+  - "ea832721dc6e7b11fc7fa795b523d8711dd85f1c"  # pragma: allowlist secret
+
+files_changed:
+  - src/ingest_sessions/omp.py
+  - src/ingest_sessions/core.py
+  - scripts/oracle_omp_shared_schema.py
+  - scripts/oracle_omp_header.py
+  - scripts/oracle_omp_entry_union.py
+  - scripts/oracle_omp_dag_order.py
+  - scripts/oracle_omp_field_mapping.py
+  - scripts/oracle_omp_subagent_discovery.py
+  - scripts/oracle_omp_version_dispatch.py
+  - scripts/oracle_omp_baseline_outcome.py
+  - scripts/oracle_omp_query_parity.py
+  - tests/test_omp.py
+
+tests_added:
+  - "tests/test_omp.py"
+
+e2e_gate:
+  spec: contracts/specs/derived-is-5a7.1.spec.json
+  command: "for f in scripts/oracle_omp_*.py; do uv run python3 \"$f\" || exit 1; done"
+  result: passed
+  ran_at_sha: "ea832721dc6e7b11fc7fa795b523d8711dd85f1c"  # pragma: allowlist secret
+  mocks_in_path: false
+
+verify_transcript:
+  oracle_c1_shared_schema: |
+    $ uv run python3 scripts/oracle_omp_shared_schema.py
+    {"records_table_count": 1, "sessions_table_count": 1, "claude_and_omp_records_share_table": true}
+    exit=0 -- matches then: exit_code eq 0, records_table_count eq 1, sessions_table_count eq 1,
+    claude_and_omp_records_share_table eq True
+  oracle_c2_header: |
+    $ uv run python3 scripts/oracle_omp_header.py
+    {"record_count": 1, "header_inserted_as_record": false, "session_id_from_header_id": true}
+    exit=0 -- matches then: record_count eq 1, header_inserted_as_record eq False,
+    session_id_from_header_id eq True
+  oracle_c3_entry_union: |
+    $ uv run python3 scripts/oracle_omp_entry_union.py
+    {"ingestion_aborted": false, "malformed_lines_skipped": 1, "recognized_entry_kind_count": 13}
+    exit=0 -- matches then: ingestion_aborted eq False, malformed_lines_skipped ge 1,
+    recognized_entry_kind_count eq 13
+  oracle_c4_dag_order: |
+    $ uv run python3 scripts/oracle_omp_dag_order.py
+    {"reconstructed_order_matches_parent_chain": true, "reconstructed_order_matches_file_order": false,
+     "history_before_first_kept_entry_dropped": true, "branch_summary_and_custom_message_present_as_messages": true}
+    exit=0 -- matches all four `then` predicates for c4
+  oracle_c5_field_mapping: |
+    $ uv run python3 scripts/oracle_omp_field_mapping.py
+    {"session_id_from_header_id": true, "uuid_from_entry_id": true, "parent_from_parent_id": true,
+     "list_content_text_extracted": true}
+    exit=0 -- matches all four `then` predicates for c5
+  oracle_c6_subagent_discovery: |
+    $ uv run python3 scripts/oracle_omp_subagent_discovery.py
+    {"subagent_file_discovered": true, "subagent_records_ingested": 2}
+    exit=0 -- matches then: subagent_file_discovered eq True, subagent_records_ingested ge 1
+  oracle_c7_version_dispatch: |
+    $ uv run python3 scripts/oracle_omp_version_dispatch.py
+    {"v1_parsed_with_v1_rules": true, "v2_parsed_with_v2_rules": true, "v3_parsed_with_v3_rules": true}
+    exit=0 -- matches all three `then` predicates for c7
+  oracle_c8_baseline_outcome: |
+    $ uv run python3 scripts/oracle_omp_baseline_outcome.py
+    {"percent_records_with_surrogate_uuid": 0.0, "percent_records_with_parent_populated": 80.0,
+     "role_typed_record_count": 6}
+    exit=0 -- matches then: percent_records_with_surrogate_uuid lt 100,
+    percent_records_with_parent_populated gt 0, role_typed_record_count gt 0
+  oracle_c9_query_parity: |
+    $ uv run python3 scripts/oracle_omp_query_parity.py
+    {"omp_record_returned_by_retrieve_relevant": true, "result_shape_matches_claude_session_result": true}
+    exit=0 -- matches then: omp_record_returned_by_retrieve_relevant eq True,
+    result_shape_matches_claude_session_result eq True
+  hermetic_env_recheck: |
+    Re-ran all 9 oracles directly under `.venv/bin/python3` (no `uv run` wrapper)
+    after `uv sync --frozen` -- the reducer's hermetic child-env resolution -- to
+    confirm they don't depend on dev-only extras (pytest etc). All 9 exit 0 with
+    identical stdout_json to the `uv run` invocations above.
+  pytest_full_suite: |
+    $ uv run pytest -q
+    ........................................................................ [ 22%]
+    ........................................................................ [ 44%]
+    ........................................................................ [ 67%]
+    ........................................................................ [ 89%]
+    ..................................                                       [100%]
+    322 passed in 87.12s (0:01:27)
+    (287 pre-existing + 34 new in tests/test_omp.py + the previously-flaky
+    test_periodic_sync_eventually_embeds_new_records, which passed this run --
+    confirmed pre-existing/unrelated flake by running the unmodified baseline
+    tree first, where it also failed once and passed on a later rerun)
+  pre_commit: |
+    $ uv run pre-commit run --files <all touched files>
+    fix end of files....................................................................Passed
+    trim trailing whitespace............................................................Passed
+    ruff................................................................................Passed
+    ruff-format..........................................................................Passed
+    mypy.................................................................................Passed
+    Detect secrets.......................................................................Passed
+    Full commit (ea832721) also passed check-subtree-edits / reroute-main-commit /
+    session-trailer (commit-msg stage hooks).
+
+summary: |
+  Added src/ingest_sessions/omp.py, a source adapter that parses omp (Oh My Pi)
+  SessionEntry JSONL transcripts into the SAME shared records/sessions tables
+  Claude Code sessions already populate (core.create_tables) -- selected by
+  which ingest function a caller invokes (core.ingest_jsonl vs
+  omp.ingest_omp_session), not a forked schema or a second table. Line 1 of an
+  omp file is consumed purely as session metadata (header id -> session_id,
+  cwd -> project_path, title -> summary via ingest_omp_session_metadata) and
+  is never inserted as a record. Every other line is parsed against the
+  13-member SessionEntry union (parse_entry) according to the header's
+  declared schema version -- v1's legacy `parent` field, v2's rename to
+  `parentId`, v3 additionally enabling compaction-truncation semantics -- and
+  a line that fails to parse or names an unrecognized kind is counted into
+  malformed_lines and skipped, matching core.ingest_jsonl's existing
+  non-fatal skip (ingestion never aborts). reconstruct_conversation_order
+  walks each entry's parentId back from a leaf to the root instead of
+  trusting file order, so a branched session threads by actual reply-chain: a
+  compaction entry drops every ancestor strictly older than its
+  firstKeptEntryId, and branch_summary/custom_message entries come back with
+  a synthesized `message` field, i.e. as regular messages.
+  discover_subagent_files recursively finds subagent transcripts at
+  <session>/<AgentId>.jsonl beside their parent (a single rglob call reaches
+  nested sub-subagents too), and ingest_omp_session ingests the parent plus
+  every discovered subagent file the same way.
+
+  Also fixed core._extract_first_prompt, which only handled a plain string
+  message.content and silently returned None for the list-of-blocks form --
+  it now reuses retrieval._content_to_text (the same flattener the lexical/
+  vector retrieval arms already use for record_text), so both Claude Code and
+  omp records with block-list content extract correctly, and the existing
+  retrieve_relevant/query tools surface omp records identically to Claude
+  Code records with zero query-path changes (verified end-to-end in the c9
+  oracle: ingested one omp + one Claude session, backfilled embeddings +
+  rebuilt the FTS index, called the real retrieve_relevant, and confirmed the
+  omp hit's dict has the same core key shape as the Claude hit's).
+
+  VERIFIED: all 9 scripts/oracle_omp_*.py probes named by
+  contracts/specs/derived-is-5a7.1.spec.json's acceptance_tests exit 0 and
+  print the exact stdout_json fields each test's `then` predicates check
+  (transcripts above), run both under `uv run python3` and directly under
+  `.venv/bin/python3` after `uv sync --frozen` (the reducer's hermetic child
+  env). 34 new unit tests in tests/test_omp.py cover the pure
+  parsing/reconstruction/field-mapping helpers directly. Full suite: 322
+  passed (287 pre-existing + 34 new + the one previously-flaky test, which
+  passed this run and was independently confirmed flaky/pre-existing against
+  the unmodified base tree). ruff, ruff-format, and mypy pass via
+  `pre-commit run` on every touched file; the full commit also passed the
+  repo's commit-msg-stage hooks (subtree-edit check, main-commit reroute
+  guard, session trailer).
+
+  Not touched: CLI wiring (cli.py's argparse `--source` selection) -- no
+  acceptance test exercises the CLI, and the real omp on-disk directory
+  layout / discovery root wasn't specified in the pebble, so CLI wiring
+  would have been speculative. All 9 acceptance criteria are satisfied by
+  calling the adapter's functions directly, exactly as each acceptance
+  criterion's own wording describes ("feed the adapter...").
+
+cost: "~180k tokens"
