@@ -1,0 +1,242 @@
+{
+  "id": "derived-is-5a7.3",
+  "original_statement": "Request: is-5a7.1 built the omp adapter (src/ingest_sessions/omp.py) and is-5a7.2 made\ndiscovery find omp files. NOTHING CALLS THE ADAPTER. `grep -n omp\nsrc/ingest_sessions/server.py src/ingest_sessions/cli.py` returns no import\nand no call site: server._ingest_all (server.py:302), server._ingest_file_full\n(server.py:257) and cli.ingest (cli.py:128) all pass every discovered path to\ncore.ingest_jsonl unconditionally. So the ~363 omp files discovery now yields\nwould be ingested through the Claude Code path, which was measured to produce\n92,013 rows with 100% surrogate uuid, 0% parent_uuid and zero user/assistant\nrows. The two landed leaves do not add up to a working feature without this\none.\n\nChange: one selector function, and every ingest call site routes through it.\n\n- core (or a small new module) gains a pure format probe that reads ONLY the\n  first line of a file and answers claude|omp: a first line that parses as\n  JSON with type == \"session\" and a non-empty \"id\" is omp; anything else is\n  claude. Content-based, not path-based -- a path test on ~/.omp is wrong for\n  a relocated root and wrong for the INGEST_SESSIONS_PROJECTS_DIR case.\n- server._ingest_file_full, server._ingest_all and cli.ingest each ask the\n  probe and call omp.ingest_omp_session for an omp file, core.ingest_jsonl for\n  a claude file. The three call sites must share the routing decision, not\n  each re-implement it.\n- The router ingests EXACTLY the file it is handed. Discovery is already\n  recursive (is-5a7.2), so <session>/<AgentId>.jsonl subagent transcripts\n  arrive as their own paths; routing them back through\n  omp.ingest_omp_session's own discover_subagent_files fan-out would ingest\n  each one twice. However it is resolved, each omp entry must be inserted\n  exactly once and each subagent file's session_id must come from ITS OWN\n  header id, never from the parent's and never from the filename stem (an omp\n  subagent filename is an agent LABEL like \"MeasureFixtureFraction\").\n- file_mtimes bookkeeping (core.file_changed / core.record_file) must be\n  applied to omp files the same way it is to claude files, so a second cold\n  scan re-reads nothing and an appended-to file is picked up.\n- The watchdog path (server._on_jsonl_event -> _ingest_file_full) gets the\n  routing for free once _ingest_file_full routes.\n\nAcceptance, measured against a THROWAWAY DuckDB built by cold-scanning the two\nreal default roots (~/.claude/projects and ~/.omp/agent/sessions) -- never the\nlive corpus, which has a server attached:\n- file_mtimes holds substantially all ~363 real omp *.jsonl paths, not 50.\n- file_mtimes still holds all 7,779 ~/.claude paths. Trading one corpus for\n  the other is a failure.\n- for records whose session_id belongs to an omp session, parent_uuid is\n  non-null at a rate comparable to the Claude population (~91%), not 0%.\n- no omp record carries a surrogate `nouuid_...` uuid.\n- an omp session row in `sessions` has a non-NULL first_prompt.\n- for at least one omp file, the sessions.session_id equals the `id` field on\n  that file's own first line, and differs from the filename stem.",
+  "restatement": "The omp session adapter (src/ingest_sessions/omp.py) and the recursive discovery that now finds omp *.jsonl files were both built and merged, but no ingest call site ever invokes the adapter: server._ingest_file_full, server._ingest_all, and cli.ingest all pass every discovered path \u2014 omp or claude \u2014 unconditionally to core.ingest_jsonl, so the ~363 real omp files discovery now finds are silently mis-ingested through the Claude Code parser (measured: 100% surrogate uuid, 0% parent_uuid, zero user/assistant rows). The fix is a single shared routing decision: a pure, content-based probe that reads only a file's first line to decide omp vs claude, wired into all three ingest call sites so none of them re-implements detection on its own. That router must ingest exactly the file it is handed \u2014 never re-triggering the omp adapter's own subagent-discovery fan-out, since discovery already hands subagent transcript files to the router as their own paths, and re-expanding them would double-insert their rows. Every file's session_id, including a subagent transcript's, must come from that file's own header id, never the parent session's id and never the filename stem (an omp subagent filename is a label, not an id). Finally, the existing file_mtimes change-tracking must treat omp files exactly as it treats claude files, so cold scans stay idempotent and appends are still picked up, without shrinking coverage of either corpus. Getting all of this right is what turns the two already-landed, individually-inert pieces (the adapter and the discovery change) into one working feature.",
+  "restatement_clauses": [
+    {
+      "id": "c1_probe",
+      "text": "A new pure format-probe function must decide, by reading ONLY the first line of a file, whether it is an omp session or a Claude Code session: if that first line parses as JSON with type == \"session\" and a non-empty \"id\" field, the file is omp; anything else is claude \u2014 and this decision must be based on file content only, never on the file's path (a check for ~/.omp is wrong for a relocated root and for the INGEST_SESSIONS_PROJECTS_DIR case)."
+    },
+    {
+      "id": "c2_shared_routing",
+      "text": "Each of the three places a file gets ingested \u2014 server._ingest_file_full, server._ingest_all, and cli.ingest \u2014 must ask this one shared probe and call omp.ingest_omp_session for an omp file or core.ingest_jsonl for a claude file, rather than each re-implementing its own detection; because the watchdog path (server._on_jsonl_event) calls _ingest_file_full, routing it correctly there fixes the watchdog path automatically, with no further change needed there."
+    },
+    {
+      "id": "c3_exact_once",
+      "text": "The router must ingest EXACTLY the file it is handed. Discovery is already recursive, so a subagent transcript file (<session>/<AgentId>.jsonl) arrives at the router as its own separate path \u2014 the router must NOT also invoke omp.ingest_omp_session's own discover_subagent_files fan-out, which would insert that subagent file's entries a second time."
+    },
+    {
+      "id": "c4_session_id_provenance",
+      "text": "Every omp file's session_id, including a subagent transcript file's, must be read from that file's OWN header id on its own first line \u2014 never inherited from the parent session's id, and never derived from the filename stem (an omp subagent filename is an agent LABEL like \"MeasureFixtureFraction\", not an id)."
+    },
+    {
+      "id": "c5_file_mtimes",
+      "text": "The existing file_mtimes bookkeeping (core.file_changed / core.record_file) must be applied to omp files the same way it already is to claude files, so a second cold scan re-reads nothing unchanged and an appended-to omp file is picked up as changed \u2014 measured against a throwaway database built by cold-scanning the two real default roots, where file_mtimes ends up holding substantially all of the roughly 363 real omp *.jsonl paths (not stuck at 50) while still holding all 7,779 of the existing ~/.claude paths."
+    }
+  ],
+  "goal": "Wire the already-built omp session adapter into every ingest call site via one shared, content-based routing probe, so the ~363 real omp transcripts discovery now finds are correctly parsed as omp sessions instead of silently falling through the Claude Code ingestion path.",
+  "acceptance_criteria": [
+    "Two temporary sample files are created: one whose first line is written to look like an omp session header (type set to \"session\", with a non-empty id) but placed somewhere that does NOT look like the default omp folder; and one whose first line looks like an ordinary Claude Code entry but placed somewhere that DOES look like the default omp folder. The check reports which format each sample was recognized as.",
+    "A single small folder containing one omp-shaped session file and one Claude-Code-shaped session file is fed, unchanged, through each of the three places a file gets ingested (the CLI ingest command, the full-scan path, and the single-file path used when a file changes), each writing into its own disposable database. The check reports, for each of the three, whether the omp file ended up as a real omp session (correct parent linkage, a real id, a non-empty opening message) rather than falling through to the Claude Code parser with a made-up id.",
+    "A small synthetic omp session is built with a parent transcript file and one subagent transcript file containing exactly 3 lines. Both file paths are handed to the router separately, the same way real folder discovery would hand them over. The check reports how many rows ended up in the database for the subagent file's own entries.",
+    "Using that same synthetic subagent file \u2014 named after a plain label like \"MeasureFixtureFraction\" rather than an id, and belonging to a parent session with its own different id \u2014 the check reports whether the subagent's session_id stored in the database matches the id written on the subagent file's own first line, and separately whether it instead matches the parent session's id or the literal filename.",
+    "First, a small synthetic folder of omp files is cold-scanned twice in a row with nothing changed in between (reporting whether the second scan found anything to re-read), then one file is appended to and scanned a third time (reporting whether that file was picked up as changed). Second, the two real session folders (~/.claude/projects and ~/.omp/agent/sessions) are cold-scanned into a disposable, throwaway database \u2014 never the live one \u2014 and the check reports how many paths from each folder ended up recorded."
+  ],
+  "request_clauses": [
+    {
+      "id": "c1",
+      "text": "Two temporary sample files are created: one whose first line is written to look like an omp session header (type set to \"session\", with a non-empty id) but placed somewhere that does NOT look like the default omp folder; and one whose first line looks like an ordinary Claude Code entry but placed somewhere that DOES look like the default omp folder. The check reports which format each sample was recognized as."
+    },
+    {
+      "id": "c2",
+      "text": "A single small folder containing one omp-shaped session file and one Claude-Code-shaped session file is fed, unchanged, through each of the three places a file gets ingested (the CLI ingest command, the full-scan path, and the single-file path used when a file changes), each writing into its own disposable database. The check reports, for each of the three, whether the omp file ended up as a real omp session (correct parent linkage, a real id, a non-empty opening message) rather than falling through to the Claude Code parser with a made-up id."
+    },
+    {
+      "id": "c3",
+      "text": "A small synthetic omp session is built with a parent transcript file and one subagent transcript file containing exactly 3 lines. Both file paths are handed to the router separately, the same way real folder discovery would hand them over. The check reports how many rows ended up in the database for the subagent file's own entries."
+    },
+    {
+      "id": "c4",
+      "text": "Using that same synthetic subagent file \u2014 named after a plain label like \"MeasureFixtureFraction\" rather than an id, and belonging to a parent session with its own different id \u2014 the check reports whether the subagent's session_id stored in the database matches the id written on the subagent file's own first line, and separately whether it instead matches the parent session's id or the literal filename."
+    },
+    {
+      "id": "c5",
+      "text": "First, a small synthetic folder of omp files is cold-scanned twice in a row with nothing changed in between (reporting whether the second scan found anything to re-read), then one file is appended to and scanned a third time (reporting whether that file was picked up as changed). Second, the two real session folders (~/.claude/projects and ~/.omp/agent/sessions) are cold-scanned into a disposable, throwaway database \u2014 never the live one \u2014 and the check reports how many paths from each folder ended up recorded."
+    }
+  ],
+  "acceptance_tests": [
+    {
+      "type": "behavior",
+      "restatement_clause_id": "c1_probe",
+      "description": "Two temporary sample files are created: one whose first line is written to look like an omp session header (type set to \"session\", with a non-empty id) but placed somewhere that does NOT look like the default omp folder; and one whose first line looks like an ordinary Claude Code entry but placed somewhere that DOES look like the default omp folder. The check reports which format each sample was recognized as.",
+      "proves": "Proves the format decision is made purely from what's inside the file's first line, not from where the file lives \u2014 an omp-shaped file is still recognized as omp outside the default omp folder, and a non-omp-shaped file is still recognized as claude even inside an omp-looking folder.",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_probe_content_based.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "relocated_omp_sample_classification",
+          "op": "eq",
+          "value": "omp"
+        },
+        {
+          "observe": "stdout_json",
+          "field": "claude_shaped_in_omp_path_classification",
+          "op": "eq",
+          "value": "claude"
+        },
+        {
+          "observe": "exit_code",
+          "field": "exit_code",
+          "op": "eq",
+          "value": 0
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 60,
+      "clause_id": "c1"
+    },
+    {
+      "type": "behavior",
+      "restatement_clause_id": "c2_shared_routing",
+      "description": "A single small folder containing one omp-shaped session file and one Claude-Code-shaped session file is fed, unchanged, through each of the three places a file gets ingested (the CLI ingest command, the full-scan path, and the single-file path used when a file changes), each writing into its own disposable database. The check reports, for each of the three, whether the omp file ended up as a real omp session (correct parent linkage, a real id, a non-empty opening message) rather than falling through to the Claude Code parser with a made-up id.",
+      "proves": "Proves the three ingest call sites make the same routing decision from one shared place \u2014 none of them silently falls back to treating the omp file as a Claude Code file \u2014 and that the resulting omp session row carries real parent linkage and a real first message, not the zero-parent, surrogate-id symptoms measured before the fix.",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_shared_routing_three_call_sites.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "cli_ingest_surrogate_uuid_count",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "ingest_all_surrogate_uuid_count",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "ingest_file_full_surrogate_uuid_count",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "parent_uuid_nonnull_rate",
+          "op": "ge",
+          "value": 0.85
+        },
+        {
+          "observe": "stdout_json",
+          "field": "session_row_first_prompt_nonnull",
+          "op": "eq",
+          "value": true
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 90,
+      "clause_id": "c2"
+    },
+    {
+      "type": "behavior",
+      "restatement_clause_id": "c3_exact_once",
+      "description": "A small synthetic omp session is built with a parent transcript file and one subagent transcript file containing exactly 3 lines. Both file paths are handed to the router separately, the same way real folder discovery would hand them over. The check reports how many rows ended up in the database for the subagent file's own entries.",
+      "proves": "Proves the router ingests exactly the file it is given and does not also expand it through the omp adapter's own subagent-discovery, which would insert the subagent's 3 lines a second time (6 rows instead of 3).",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_router_exactly_once.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "subagent_row_count",
+          "op": "eq",
+          "value": 3
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 60,
+      "clause_id": "c3"
+    },
+    {
+      "type": "behavior",
+      "restatement_clause_id": "c4_session_id_provenance",
+      "description": "Using that same synthetic subagent file \u2014 named after a plain label like \"MeasureFixtureFraction\" rather than an id, and belonging to a parent session with its own different id \u2014 the check reports whether the subagent's session_id stored in the database matches the id written on the subagent file's own first line, and separately whether it instead matches the parent session's id or the literal filename.",
+      "proves": "Proves each file's session_id comes from that file's own header, never the parent session's id and never the filename.",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_session_id_provenance.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "subagent_session_id_matches_own_header",
+          "op": "eq",
+          "value": true
+        },
+        {
+          "observe": "stdout_json",
+          "field": "subagent_session_id_matches_filename_stem",
+          "op": "eq",
+          "value": false
+        },
+        {
+          "observe": "stdout_json",
+          "field": "subagent_session_id_matches_parent_id",
+          "op": "eq",
+          "value": false
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 60,
+      "clause_id": "c4"
+    },
+    {
+      "type": "behavior",
+      "restatement_clause_id": "c5_file_mtimes",
+      "description": "First, a small synthetic folder of omp files is cold-scanned twice in a row with nothing changed in between (reporting whether the second scan found anything to re-read), then one file is appended to and scanned a third time (reporting whether that file was picked up as changed). Second, the two real session folders (~/.claude/projects and ~/.omp/agent/sessions) are cold-scanned into a disposable, throwaway database \u2014 never the live one \u2014 and the check reports how many paths from each folder ended up recorded.",
+      "proves": "Proves omp files are tracked for re-scan and change-detection exactly as claude files always have been (idempotent re-scans, appends detected), and that adding omp coverage doesn't shrink either corpus: the omp folder's roughly 363 files show up substantially in full (not stuck at 50), and all 7,779 of the existing claude paths are still there.",
+      "when": {
+        "interpreter": "python3",
+        "script": "scripts/oracle_file_mtimes_bookkeeping.py",
+        "args": [],
+        "stdin": ""
+      },
+      "then": [
+        {
+          "observe": "stdout_json",
+          "field": "rescan_unchanged_count",
+          "op": "eq",
+          "value": 0
+        },
+        {
+          "observe": "stdout_json",
+          "field": "after_append_changed_count",
+          "op": "ge",
+          "value": 1
+        },
+        {
+          "observe": "stdout_json",
+          "field": "omp_paths_recorded",
+          "op": "ge",
+          "value": 300
+        },
+        {
+          "observe": "stdout_json",
+          "field": "claude_paths_recorded",
+          "op": "ge",
+          "value": 7779
+        }
+      ],
+      "max_runs": 1,
+      "timeout_seconds": 900,
+      "clause_id": "c5"
+    }
+  ],
+  "criticality": "marginal",
+  "verification_level": "bounded_model_check"
+}
