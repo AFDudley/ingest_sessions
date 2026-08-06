@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -365,6 +367,45 @@ def create_tables(db: duckdb.DuckDBPyConnection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_supersessions_superseded_id "
         "ON supersessions(superseded_id)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Discovery (pebble is-5a7.2)
+#
+# The single recursive, multi-root *.jsonl discovery used by both the cold
+# scan and the live watchdog, so the two roots lists can never drift apart.
+# ---------------------------------------------------------------------------
+
+
+def default_discovery_roots() -> list[Path]:
+    """The default scan roots: Claude sessions + omp sessions."""
+    home = Path.home()
+    return [
+        home / ".claude" / "projects",
+        home / ".omp" / "agent" / "sessions",
+    ]
+
+
+def resolve_discovery_roots(env_value: str | None) -> list[Path]:
+    """Resolve the configured root list.
+
+    ``env_value`` (INGEST_SESSIONS_PROJECTS_DIR) sets the WHOLE list, parsed
+    as os.pathsep-separated paths, replacing the default rather than adding
+    to it. Empty/unset falls back to ``default_discovery_roots()``.
+    """
+    if env_value:
+        return [Path(p) for p in env_value.split(os.pathsep) if p]
+    return default_discovery_roots()
+
+
+def discover_session_files(roots: Iterable[Path]) -> list[Path]:
+    """Every *.jsonl beneath each root, at any depth. Missing roots are skipped."""
+    files: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        files.extend(sorted(root.rglob("*.jsonl")))
+    return files
 
 
 # ---------------------------------------------------------------------------

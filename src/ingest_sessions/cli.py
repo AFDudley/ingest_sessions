@@ -26,6 +26,7 @@ import duckdb
 from ingest_sessions.core import (
     build_session_metadata,
     create_tables,
+    discover_session_files,
     ingest_history,
     ingest_jsonl,
     ingest_session_metadata,
@@ -113,7 +114,7 @@ def ingest(config: IngestConfig) -> None:
     total_records = 0
 
     for proj_dir in project_dirs:
-        jsonl_files = sorted(proj_dir.glob("*.jsonl"))
+        jsonl_files = discover_session_files([proj_dir])
         if not jsonl_files:
             continue
 

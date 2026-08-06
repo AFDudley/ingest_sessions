@@ -65,6 +65,7 @@ from ingest_sessions.supersession import (
 from ingest_sessions.core import (
     build_session_metadata,
     create_tables,
+    discover_session_files,
     file_changed,
     ingest_history,
     ingest_jsonl,
@@ -73,6 +74,7 @@ from ingest_sessions.core import (
     project_record_texts,
     record_file,
     register_functions,
+    resolve_discovery_roots,
     write_fts_index,
 )
 from ingest_sessions.embeddings import embed_texts, record_text, summary_text
@@ -147,11 +149,14 @@ def _db_path() -> str:
     return os.environ.get("INGEST_SESSIONS_DB", default)
 
 
-def _projects_dir() -> Path:
-    env = os.environ.get("INGEST_SESSIONS_PROJECTS_DIR")
-    if env:
-        return Path(env)
-    return Path.home() / ".claude" / "projects"
+def _discovery_roots() -> list[Path]:
+    """The configured scan roots (env INGEST_SESSIONS_PROJECTS_DIR sets the
+    whole list, os.pathsep-separated; unset falls back to the defaults).
+
+    Both the cold scan (_ingest_all) and the watchdog (_start_watcher) draw
+    their roots from this single function, so they can never drift apart.
+    """
+    return resolve_discovery_roots(os.environ.get("INGEST_SESSIONS_PROJECTS_DIR"))
 
 
 def _history_file() -> Path:
@@ -284,25 +289,21 @@ def _ingest_all(db: duckdb.DuckDBPyConnection) -> None:
     """Incremental ingestion: only re-process files modified since last run."""
     from ingest_sessions.blobs import blob_dir
 
-    projects_dir = _projects_dir()
-    if not projects_dir.exists():
-        return
-
-    project_dirs = sorted(d for d in projects_dir.iterdir() if d.is_dir())
+    jsonl_files = discover_session_files(_discovery_roots())
+    project_dirs = sorted({f.parent for f in jsonl_files})
     session_meta = build_session_metadata(project_dirs)
     _blob_root = blob_dir()
 
-    for proj_dir in project_dirs:
-        for jsonl_path in sorted(proj_dir.glob("*.jsonl")):
-            changed, prev_size = file_changed(db, jsonl_path)
-            if not changed:
-                continue
-            session_id = jsonl_path.stem
-            _, bytes_read = ingest_jsonl(
-                db, jsonl_path, byte_offset=prev_size, blob_root=_blob_root
-            )
-            ingest_session_metadata(db, session_id, session_meta)
-            record_file(db, jsonl_path, size_bytes=bytes_read)
+    for jsonl_path in jsonl_files:
+        changed, prev_size = file_changed(db, jsonl_path)
+        if not changed:
+            continue
+        session_id = jsonl_path.stem
+        _, bytes_read = ingest_jsonl(
+            db, jsonl_path, byte_offset=prev_size, blob_root=_blob_root
+        )
+        ingest_session_metadata(db, session_id, session_meta)
+        record_file(db, jsonl_path, size_bytes=bytes_read)
 
     history = _history_file()
     if history.exists():
@@ -892,12 +893,23 @@ class _JsonlHandler(FileSystemEventHandler):
         req.log_errors = True
 
 
+def _schedule_watches(observer: BaseObserver, roots: list[Path]) -> list[Any]:
+    """Schedule a recursive watch on each root (creating it if missing).
+
+    Returns the ObservedWatch objects, one per root, in root order — the
+    same roots list the cold scan (_ingest_all) walks (pebble is-5a7.2 c5).
+    """
+    watches = []
+    for root in roots:
+        root.mkdir(parents=True, exist_ok=True)
+        watches.append(observer.schedule(_JsonlHandler(), str(root), recursive=True))
+    return watches
+
+
 def _start_watcher() -> BaseObserver:
-    """Start watchdog observer on the projects directory."""
-    projects_dir = _projects_dir()
-    projects_dir.mkdir(parents=True, exist_ok=True)
+    """Start watchdog observer on every configured discovery root."""
     observer = Observer()
-    observer.schedule(_JsonlHandler(), str(projects_dir), recursive=True)
+    _schedule_watches(observer, _discovery_roots())
     observer.daemon = True
     observer.start()
     return observer
