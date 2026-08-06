@@ -421,19 +421,28 @@ def discover_session_files(roots: Iterable[Path]) -> list[Path]:
 
 
 def probe_session_format(jsonl_path: Path) -> Literal["omp", "claude"]:
-    """Classify *jsonl_path* as "omp" or "claude" from ONLY its first line.
+    """Classify *jsonl_path* as "omp" or "claude" from ONLY its leading lines.
 
     Content-based, never path-based: a check against ``~/.omp`` would be
     wrong for a relocated root or an INGEST_SESSIONS_PROJECTS_DIR override.
-    An omp session file's first line is a ``type: "session"`` header with a
-    non-empty ``id`` (see ``omp.parse_header``); anything else -- including
-    an unparseable or empty first line -- is Claude Code's format.
+    An omp session file's header -- a ``type: "session"`` object with a
+    non-empty ``id`` -- isn't always line 1 (omp keeps a rewritten-in-place
+    ``title`` record ahead of it), so this scans the SAME bounded window of
+    leading lines (``omp.HEADER_SCAN_BOUND``, ``omp.find_header``) that
+    ``omp.ingest_omp_jsonl`` scans, so classification and ingestion can
+    never disagree about whether a file is omp. No header within that
+    window -- including an unparseable or empty leading line -- is Claude
+    Code's format.
     """
-    from ingest_sessions.omp import parse_header
+    from ingest_sessions.omp import HEADER_SCAN_BOUND, find_header
 
     with open(jsonl_path, "rb") as f:
-        first_line = f.readline().decode("utf-8", errors="replace")
-    return "omp" if parse_header(first_line) is not None else "claude"
+        leading = [
+            f.readline().decode("utf-8", errors="replace")
+            for _ in range(HEADER_SCAN_BOUND)
+        ]
+    header, _ = find_header(leading)
+    return "omp" if header is not None else "claude"
 
 
 def ingest_routed_file(

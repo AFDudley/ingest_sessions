@@ -1,21 +1,31 @@
-"""omp (Oh My Pi) session transcript adapter (pebble is-5a7.1).
+"""omp (Oh My Pi) session transcript adapter (pebble is-5a7.1, is-5a7.4).
 
 Parses omp's SessionEntry JSONL format into the SAME shared `records` /
 `sessions` tables Claude Code sessions already populate (see core.py) --
 selected by source (this module vs. `core.ingest_jsonl`), never a forked
 schema or a second table.
 
-Line 1 of an omp session file is a `type: "session"` HEADER (id, cwd,
-title, version, optional parentSession) -- session metadata, never a
-data record. Every other line is one member of the omp SessionEntry
-union (`OMP_ENTRY_KINDS`), parsed according to the header's declared
-schema version. Conversation order is NOT file order: omp sessions can
-branch, so `reconstruct_conversation_order` walks each entry's parentId
-back from a leaf to the root (matching buildSessionContext semantics --
-compaction entries truncate history at `firstKeptEntryId`,
-branch_summary/custom_message entries become synthetic messages).
+The `type: "session"` HEADER (id, cwd, title, version, optional
+parentSession) -- session metadata, never a data record -- is not always
+line 1: omp keeps a fixed-width, rewritten-in-place `type: "title"` record
+at the head of the file (see its `pad` field) so a session's title can be
+updated without rewriting the whole transcript, which pushes the real
+header to line 2 on the real corpus. `find_header` locates it by scanning
+the leading `HEADER_SCAN_BOUND` lines for the first `type: "session"`
+object with a non-empty `id`, rather than requiring index 0 -- the SAME
+bounded scan `core.probe_session_format` uses, so classification and
+ingestion can never disagree about whether a file is omp. Every line at
+or before the header's index is session-level PREAMBLE: never inserted as
+a record, never counted as malformed. Every other line is one member of
+the omp SessionEntry union (`OMP_ENTRY_KINDS`), parsed according to the
+header's declared schema version. Conversation order is NOT file order:
+omp sessions can branch, so `reconstruct_conversation_order` walks each
+entry's parentId back from a leaf to the root (matching
+buildSessionContext semantics -- compaction entries truncate history at
+`firstKeptEntryId`, branch_summary/custom_message entries become
+synthetic messages).
 
-# See contracts/specs/derived-is-5a7.1.spec.json
+# See contracts/specs/derived-is-5a7.1.spec.json, derived-is-5a7.4.spec.json
 """
 
 from __future__ import annotations
@@ -56,15 +66,22 @@ OMP_ENTRY_KINDS = frozenset(
 _SYNTHETIC_MESSAGE_KINDS = frozenset({"branch_summary", "custom_message"})
 
 
-def parse_header(first_line: str) -> dict[str, Any] | None:
-    """Parse line 1 of an omp session file as session metadata.
+# How many leading lines a header search may look at (pebble is-5a7.4).
+# 2 covers every file on the real corpus today (title line + header line);
+# kept small so a `session`-shaped line buried deep in a Claude Code
+# transcript can never drag it into this adapter.
+HEADER_SCAN_BOUND = 2
 
-    Returns None if the line isn't a valid `type: "session"` header with
-    an `id` -- callers use this to detect a non-omp file rather than
-    raising.
+
+def parse_header(line: str) -> dict[str, Any] | None:
+    """Parse one line of an omp session file as a session header.
+
+    Returns None if the line isn't a valid `type: "session"` object with
+    a non-empty `id` -- callers use this to detect a non-header line
+    rather than raising.
     """
     try:
-        obj = json.loads(first_line)
+        obj = json.loads(line)
     except json.JSONDecodeError:
         return None
     if not isinstance(obj, dict) or obj.get("type") != "session":
@@ -72,6 +89,26 @@ def parse_header(first_line: str) -> dict[str, Any] | None:
     if not obj.get("id"):
         return None
     return obj
+
+
+def find_header(
+    lines: list[str], bound: int = HEADER_SCAN_BOUND
+) -> tuple[dict[str, Any] | None, int | None]:
+    """Scan the first *bound* lines for the session header.
+
+    Returns ``(header, index)`` for the first of the leading *bound*
+    entries in *lines* that `parse_header`s as a valid header; ``(None,
+    None)`` if none of them does -- callers use this to detect a non-omp
+    file. `core.probe_session_format` calls this with the SAME bound over
+    a file's first `HEADER_SCAN_BOUND` raw lines, so classification and
+    ingestion (`ingest_omp_jsonl`) can never disagree about whether a file
+    is omp.
+    """
+    for i, line in enumerate(lines[:bound]):
+        header = parse_header(line)
+        if header is not None:
+            return header, i
+    return None, None
 
 
 def _parent_field(version: int) -> str:
@@ -263,10 +300,15 @@ def ingest_omp_jsonl(
 ) -> tuple[int, int, dict[str, Any] | None]:
     """Ingest one omp session file. Returns (record_count, malformed_count, header).
 
-    Line 1 is consumed as session metadata and never inserted as a
-    record; *header* is None (0, 0 returned) when it isn't a valid `type:
-    "session"` header, so callers can tell "not an omp file" from "empty
-    file". Every other line is parsed per `parse_entry`, using the
+    The header is located by `find_header`'s bounded scan of the leading
+    `HEADER_SCAN_BOUND` lines; *header* is None (0, 0 returned) when none
+    of them is a valid `type: "session"` header, so callers can tell "not
+    an omp file" from "empty file". Every line at or before the header's
+    index -- including a `title` preamble line ahead of it -- is
+    consumed as preamble: never inserted as a record, never counted as
+    malformed. The header stays the sole source of session metadata
+    (`ingest_omp_session_metadata` reads it, never the preamble). Every
+    line after the header index is parsed per `parse_entry`, using the
     header's declared version; a line that fails JSON parsing or doesn't
     match a recognized SessionEntry kind is counted as malformed and
     skipped -- the ingest never aborts, mirroring
@@ -274,28 +316,31 @@ def ingest_omp_jsonl(
     """
     raw = jsonl_path.read_bytes()
     now_ms = int(time.time() * 1000)
+    raw_lines = raw.split(b"\n")
 
-    header: dict[str, Any] | None = None
-    session_id = jsonl_path.stem
-    version = 3
+    leading = [
+        raw_lines[i].decode("utf-8", errors="replace")
+        for i in range(min(HEADER_SCAN_BOUND, len(raw_lines)))
+    ]
+    header, header_index = find_header(leading)
+    if header is None or header_index is None:
+        return 0, 0, None
+    session_id = header["id"]
+    version = header.get("version", 3)
+
     batch: list[tuple[str, str, str, Any, str | None, str]] = []
     malformed: list[tuple[str, int, str, int]] = []
 
     pos = 0
-    for i, raw_line in enumerate(raw.split(b"\n")):
+    for i, raw_line in enumerate(raw_lines):
         line_start = pos
         pos += len(raw_line) + 1
         if not raw_line.strip():
             continue
+        if i <= header_index:
+            continue  # session-level preamble (the header itself, or a
+            # title line ahead of it) -- never a record, never malformed.
         line = raw_line.decode("utf-8", errors="replace")
-
-        if i == 0:
-            header = parse_header(line)
-            if header is None:
-                return 0, 0, None
-            session_id = header["id"]
-            version = header.get("version", 3)
-            continue
 
         try:
             obj = json.loads(line)
