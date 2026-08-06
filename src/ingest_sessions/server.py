@@ -68,7 +68,7 @@ from ingest_sessions.core import (
     discover_session_files,
     file_changed,
     ingest_history,
-    ingest_jsonl,
+    ingest_routed_file,
     ingest_session_metadata,
     fetch_record_raws,
     project_record_texts,
@@ -253,12 +253,12 @@ def _ingest_file_full(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
     from ingest_sessions.blobs import blob_dir
 
     _, prev_size = file_changed(db, jsonl_path)
-    session_id = jsonl_path.stem
-    count, bytes_read = ingest_jsonl(
+    count, bytes_read, fmt = ingest_routed_file(
         db, jsonl_path, byte_offset=prev_size, blob_root=blob_dir()
     )
-    session_meta = build_session_metadata([jsonl_path.parent])
-    ingest_session_metadata(db, session_id, session_meta)
+    if fmt == "claude":
+        session_meta = build_session_metadata([jsonl_path.parent])
+        ingest_session_metadata(db, jsonl_path.stem, session_meta)
     record_file(db, jsonl_path, size_bytes=bytes_read)
     return count
 
@@ -298,11 +298,11 @@ def _ingest_all(db: duckdb.DuckDBPyConnection) -> None:
         changed, prev_size = file_changed(db, jsonl_path)
         if not changed:
             continue
-        session_id = jsonl_path.stem
-        _, bytes_read = ingest_jsonl(
+        _, bytes_read, fmt = ingest_routed_file(
             db, jsonl_path, byte_offset=prev_size, blob_root=_blob_root
         )
-        ingest_session_metadata(db, session_id, session_meta)
+        if fmt == "claude":
+            ingest_session_metadata(db, jsonl_path.stem, session_meta)
         record_file(db, jsonl_path, size_bytes=bytes_read)
 
     history = _history_file()

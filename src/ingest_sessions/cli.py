@@ -28,7 +28,7 @@ from ingest_sessions.core import (
     create_tables,
     discover_session_files,
     ingest_history,
-    ingest_jsonl,
+    ingest_routed_file,
     ingest_session_metadata,
 )
 
@@ -124,9 +124,9 @@ def ingest(config: IngestConfig) -> None:
             if filter_lower and filter_lower not in text.lower():
                 continue
 
-            session_id = jsonl_path.stem
-            count, _ = ingest_jsonl(db, jsonl_path)
-            ingest_session_metadata(db, session_id, session_meta)
+            count, _, fmt = ingest_routed_file(db, jsonl_path)
+            if fmt == "claude":
+                ingest_session_metadata(db, jsonl_path.stem, session_meta)
             total_records += count
             proj_sessions += 1
 

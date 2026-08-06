@@ -13,7 +13,7 @@ import os
 import time
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import duckdb
 
@@ -406,6 +406,75 @@ def discover_session_files(roots: Iterable[Path]) -> list[Path]:
             continue
         files.extend(sorted(root.rglob("*.jsonl")))
     return files
+
+
+# ---------------------------------------------------------------------------
+# Format routing (pebble is-5a7.3)
+#
+# discover_session_files finds Claude Code and omp transcripts side by side,
+# but their JSONL shapes are incompatible -- feeding an omp file through the
+# Claude parser silently produces surrogate uuids and zero parent linkage.
+# probe_session_format + ingest_routed_file are the ONE shared place every
+# ingest call site (cli.ingest, server._ingest_file_full, server._ingest_all)
+# makes and applies that decision, so none of them re-implements detection.
+# ---------------------------------------------------------------------------
+
+
+def probe_session_format(jsonl_path: Path) -> Literal["omp", "claude"]:
+    """Classify *jsonl_path* as "omp" or "claude" from ONLY its first line.
+
+    Content-based, never path-based: a check against ``~/.omp`` would be
+    wrong for a relocated root or an INGEST_SESSIONS_PROJECTS_DIR override.
+    An omp session file's first line is a ``type: "session"`` header with a
+    non-empty ``id`` (see ``omp.parse_header``); anything else -- including
+    an unparseable or empty first line -- is Claude Code's format.
+    """
+    from ingest_sessions.omp import parse_header
+
+    with open(jsonl_path, "rb") as f:
+        first_line = f.readline().decode("utf-8", errors="replace")
+    return "omp" if parse_header(first_line) is not None else "claude"
+
+
+def ingest_routed_file(
+    db: duckdb.DuckDBPyConnection,
+    jsonl_path: Path,
+    *,
+    byte_offset: int = 0,
+    blob_root: Path | None = None,
+) -> tuple[int, int, Literal["omp", "claude"]]:
+    """Ingest EXACTLY *jsonl_path*, routed to its adapter by content.
+
+    Shared by cli.ingest, server._ingest_file_full and server._ingest_all.
+    Ingests exactly the file it is given: an omp subagent transcript that
+    discovery hands over as its own path is ingested via ``ingest_omp_jsonl``
+    directly, never through ``omp.ingest_omp_session``'s own
+    ``discover_subagent_files`` fan-out -- which would insert that
+    subagent's entries a second time once discovery also walks into its
+    directory on its own.
+
+    Returns ``(record_count, bytes_read, format)`` -- the first two matching
+    ``ingest_jsonl``'s contract. An omp file has no incremental byte-offset
+    support (its header line must be seen on every pass); ``INSERT OR
+    IGNORE`` on the ``records`` primary key makes a full re-read idempotent,
+    so *byte_offset* is honored only for a claude file, and an omp file's
+    ``bytes_read`` is simply its current size. Session metadata for an omp
+    file is inserted here, from its own header (never index/derive-based);
+    for a claude file it is left to the caller, whose index-file lookup
+    strategy differs between ``_ingest_all`` and ``_ingest_file_full``.
+    """
+    if probe_session_format(jsonl_path) == "omp":
+        from ingest_sessions.omp import ingest_omp_jsonl, ingest_omp_session_metadata
+
+        count, _, header = ingest_omp_jsonl(db, jsonl_path)
+        if header is not None:
+            ingest_omp_session_metadata(db, header)
+        return count, jsonl_path.stat().st_size, "omp"
+
+    count, bytes_read = ingest_jsonl(
+        db, jsonl_path, byte_offset=byte_offset, blob_root=blob_root
+    )
+    return count, bytes_read, "claude"
 
 
 # ---------------------------------------------------------------------------
