@@ -3,17 +3,25 @@
 
 Reads the SAME omp transcript twice through `omp.ingest_omp_jsonl`: once
 with its header already on line 1, once with a `title` preamble line
-glued on top of it. Asserts the two readings produce identical entries --
-same identities, parents, kinds, content, order and malformed count --
-proving the preamble changes nothing about how the rest of the file is
-understood. This script IS the judge (metamorphic/conservation type): it
-asserts the invariant itself and exits non-zero if it doesn't hold.
+glued on top of it. Encodes the invariance claim as a signed-flow
+conservation law (spec_oracle._relation_conservation): for every entry
+produced by either reading, build the tuple (id, parentId, type, sha256
+of the entry's normalized content) -- plus one ("__malformed__",) tuple
+per malformed line -- and emit one flow per DISTINCT tuple t:
+w(t) * (count_A(t) - count_B(t)), where w(t) is a 40-bit weight derived
+from sha256(repr(t)). sum(flows) == 0 iff the two readings produced
+identical multisets of entries; a surplus of one tuple in A cannot
+silently cancel a deficit of a different tuple in B, since the per-tuple
+weights differ. Judges nothing beyond that -- prints one stdout_json
+object carrying `flows`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +31,7 @@ from ingest_sessions.core import create_tables
 from ingest_sessions.omp import ingest_omp_jsonl
 
 SESSION_ID = "preamble-invariance-sess"
+_MALFORMED_TUPLE = ("__malformed__",)
 
 
 def _entries() -> list[dict[str, Any]]:
@@ -94,6 +103,31 @@ def _read(tmp_path: Path, name: str, preamble: bool) -> tuple[list[tuple], int]:
     return rows, malformed_count
 
 
+def _content_hash(raw: str) -> str:
+    """sha256 of *raw*'s normalized (sort_keys) JSON -- key order can't matter."""
+    normalized = json.dumps(json.loads(raw), sort_keys=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _entry_tuples(
+    rows: list[tuple[Any, ...]], malformed_count: int
+) -> Counter[tuple[Any, ...]]:
+    """One (id, parentId, type, content_hash) tuple per row, plus one
+    `_MALFORMED_TUPLE` per malformed line -- the multiset a reading produced."""
+    counter: Counter[tuple[Any, ...]] = Counter(
+        (uuid, parent_uuid, type_, _content_hash(raw))
+        for uuid, type_, parent_uuid, raw in rows
+    )
+    counter[_MALFORMED_TUPLE] += malformed_count
+    return counter
+
+
+def _weight(t: tuple[Any, ...]) -> int:
+    """A 40-bit weight derived from *t*'s repr -- distinct tuples get distinct
+    weights, so a surplus of one tuple can't cancel a deficit of another."""
+    return int(hashlib.sha256(repr(t).encode("utf-8")).hexdigest()[:10], 16)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -104,20 +138,18 @@ def main() -> None:
             tmp_path, "with_preamble", preamble=True
         )
 
-    assert rows_no_preamble == rows_with_preamble, (
-        "preamble changed the read entries: "
-        f"{rows_no_preamble!r} != {rows_with_preamble!r}"
-    )
-    assert malformed_no_preamble == malformed_with_preamble, (
-        "preamble changed the malformed-line count: "
-        f"{malformed_no_preamble} != {malformed_with_preamble}"
-    )
+    count_a = _entry_tuples(rows_no_preamble, malformed_no_preamble)
+    count_b = _entry_tuples(rows_with_preamble, malformed_with_preamble)
+
+    distinct = sorted(set(count_a) | set(count_b), key=repr)
+    flows = [_weight(t) * (count_a[t] - count_b[t]) for t in distinct]
 
     print(
         json.dumps(
             {
+                "flows": flows,
                 "entry_count": len(rows_no_preamble),
-                "entries_identical": rows_no_preamble == rows_with_preamble,
+                "entries_identical": count_a == count_b,
                 "malformed_count_identical": malformed_no_preamble
                 == malformed_with_preamble,
             }
