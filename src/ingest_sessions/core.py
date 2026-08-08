@@ -248,10 +248,22 @@ def rebuild_fts_snapshot(db: duckdb.DuckDBPyConnection) -> int:
     incremental path cannot decompose -- which is what the
     ``INGEST_SESSIONS_FTS_MIN_INTERVAL`` throttle exists to ration.
 
+    ``create_fts_index`` drops and recreates a whole schema, so an interrupt
+    part-way leaves the connection's implicit transaction ABORTED and every
+    later statement on it fails with "Current transaction is aborted". The
+    explicit BEGIN/ROLLBACK is what returns the connection usable, exactly as
+    :func:`write_fts_index` does for the replace path.
+
     Returns the indexed row count.
     """
-    db.execute("PRAGMA create_fts_index('record_fts', 'uuid', 'text', overwrite=1)")
-    row = db.execute("SELECT count(*) FROM record_fts").fetchone()
+    db.execute("BEGIN TRANSACTION")
+    try:
+        db.execute("PRAGMA create_fts_index('record_fts', 'uuid', 'text', overwrite=1)")
+        row = db.execute("SELECT count(*) FROM record_fts").fetchone()
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
     return row[0] if row else 0
 
 

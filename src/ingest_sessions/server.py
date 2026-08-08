@@ -945,6 +945,17 @@ def _db_loop() -> None:
                 req.result = _run_op_with_budget(db, req.fn, budget)
             except Exception as exc:
                 req.error = exc
+                # Every request shares ONE connection, so a failed op that left
+                # a transaction open poisons every op after it: DuckDB rejects
+                # each one with "Current transaction is aborted (please
+                # ROLLBACK)" until someone rolls back, and nobody ever did --
+                # one interrupted create_fts_index took the whole service down
+                # until it was restarted. Ops are expected to clean up after
+                # themselves; this is the backstop that makes the DB loop's
+                # promise -- the connection is usable for the NEXT request --
+                # true regardless of whether they did.
+                with contextlib.suppress(Exception):
+                    db.execute("ROLLBACK")
             req.done.set()
             if req.log_errors and req.error:
                 print(

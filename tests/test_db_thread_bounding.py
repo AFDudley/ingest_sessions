@@ -139,6 +139,45 @@ def test_head_of_line_blocking_is_bounded(
         assert heavy_req.error is not None
 
 
+def _interrupted_inside_a_transaction(db: duckdb.DuckDBPyConnection) -> None:
+    """Open a transaction, then run past the per-op budget inside it.
+
+    The shape of the op that took the whole service down: the budget timer
+    interrupts `create_fts_index` mid-transaction, DuckDB leaves the
+    connection's transaction ABORTED, and because every request shares that
+    one connection each later op is rejected with "Current transaction is
+    aborted (please ROLLBACK)" until somebody rolls back. Nobody did, so the
+    server served nothing until it was restarted.
+    """
+    db.execute("BEGIN TRANSACTION")
+    db.execute("CREATE TABLE poison (id INTEGER)")
+    _heavy(db)
+
+
+def test_an_interrupted_transaction_does_not_poison_the_next_op(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The DB loop hands the NEXT request a usable connection, always.
+
+    Ops are expected to clean up their own transactions, but an INTERRUPT can
+    land anywhere -- including inside a DDL statement whose own handler never
+    runs. The loop rolls back on error so a poisoned connection cannot outlive
+    the request that poisoned it.
+    """
+    assert _set_isolated_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("INGEST_SESSIONS_DB_OP_BUDGET_SEC", "1")
+
+    with running_db_thread():
+        bad = server._db_submit(_interrupted_inside_a_transaction)
+        assert bad.done.wait(timeout=30)
+        assert bad.error is not None
+
+        good = server._db_submit(_trivial)
+        assert good.done.wait(timeout=30)
+        assert good.error is None, f"connection left poisoned: {good.error}"
+        assert good.result == [(1,)]
+
+
 def test_connection_memory_and_threads_are_bounded(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
