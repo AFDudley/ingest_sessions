@@ -891,6 +891,37 @@ async def _stop_sync_task(task: asyncio.Task[None]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _warm_vector_index(db: duckdb.DuckDBPyConnection) -> None:
+    """Force the persistent HNSW index off disk before the queue opens.
+
+    A file-backed HNSW index is loaded lazily on first access, and at 1.5M x
+    EMBED_DIM that load is tens of seconds. The first queued op to touch
+    ``record_embeddings`` therefore pays it INSIDE the per-op budget and is
+    interrupted: after every restart the first periodic sweep died with
+    ``INTERRUPT Error: Interrupted!`` before embedding anything, and the first
+    ``retrieve_relevant`` was interrupted at 30s where the second took 11s.
+    Neither is a runaway op -- both are the same one-time load charged to
+    whoever arrives first.
+
+    So pay it HERE, on the DB thread during startup, alongside ``_ingest_all``
+    and before ``_startup_done``: unbudgeted (the queue is not yet draining,
+    so nothing is being starved) and once. This is the storage-layer twin of
+    ``_warm_models``, which front-loads the ONNX models for the same reason.
+    Best-effort: an empty or index-less corpus must not block startup.
+    """
+    from ingest_sessions.embeddings import EMBED_DIM
+
+    try:
+        db.execute(
+            "SELECT uuid FROM record_embeddings "
+            f"ORDER BY array_cosine_distance(embedding, ?::FLOAT[{EMBED_DIM}]) "
+            "LIMIT 1",
+            [[0.0] * EMBED_DIM],
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — warming is best-effort, never fatal
+        print(f"[ingest-sessions] vector index warm failed: {exc}", file=sys.stderr)
+
+
 def _db_loop() -> None:
     """Single database thread.  Owns the connection, drains the queue."""
     path = _db_path()
@@ -901,6 +932,7 @@ def _db_loop() -> None:
         create_tables(db)
         register_functions(db)
         _ingest_all(db)
+        _warm_vector_index(db)
         _startup_done.set()
 
         while True:
