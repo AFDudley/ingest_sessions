@@ -255,10 +255,20 @@ def _run_op_with_budget(
 
 
 def _ingest_file_full(db: duckdb.DuckDBPyConnection, jsonl_path: Path) -> int:
-    """Ingest records AND session metadata for a single JSONL file."""
+    """Ingest records AND session metadata for a single JSONL file.
+
+    Returns 0 without touching the file when ``file_changed`` says it has not
+    been modified since the last pass -- the same guard ``_ingest_all`` has
+    always applied. The watchdog fires several events per write (and events
+    for writes that changed nothing), and this is the ONLY place that can
+    reject them, because deciding needs the ``file_mtimes`` row and therefore
+    the DB thread.
+    """
     from ingest_sessions.blobs import blob_dir
 
-    _, prev_size = file_changed(db, jsonl_path)
+    changed, prev_size = file_changed(db, jsonl_path)
+    if not changed:
+        return 0
     count, bytes_read, fmt = ingest_routed_file(
         db, jsonl_path, byte_offset=prev_size, blob_root=blob_dir()
     )
@@ -879,6 +889,40 @@ def _stop_db_thread() -> None:
 # ---------------------------------------------------------------------------
 
 
+# A live transcript is appended to many times a second and watchdog emits
+# several events per write, so enqueueing one ingest per EVENT made the
+# single DB queue grow without bound: an inbound MCP query lands behind every
+# redundant ingest already queued and expires on _db_wait_timeout_sec()
+# without ever reaching the connection. Coalesce instead — at most ONE queued
+# ingest per path, so queue depth is bounded by the number of distinct files
+# with pending changes rather than by the event rate.
+_pending_ingests: set[str] = set()
+_pending_ingests_lock = threading.Lock()
+
+
+def _submit_ingest(path: Path) -> None:
+    """Queue an ingest of *path* unless one is already queued for it.
+
+    The pending marker is cleared when the ingest STARTS, not when it
+    finishes: an append landing mid-ingest must be able to queue the
+    follow-up pass that picks it up, or the tail of a file being written
+    during its own ingest would be lost until the next unrelated event.
+    """
+    key = str(path)
+    with _pending_ingests_lock:
+        if key in _pending_ingests:
+            return
+        _pending_ingests.add(key)
+
+    def _run(db: duckdb.DuckDBPyConnection) -> int:
+        with _pending_ingests_lock:
+            _pending_ingests.discard(key)
+        return _ingest_file_full(db, path)
+
+    req = _db_submit(_run)
+    req.log_errors = True
+
+
 class _JsonlHandler(FileSystemEventHandler):
     """Watchdog handler that enqueues new/modified JSONL files."""
 
@@ -894,9 +938,7 @@ class _JsonlHandler(FileSystemEventHandler):
         path = Path(str(event.src_path))
         if path.suffix != ".jsonl":
             return
-        captured = path
-        req = _db_submit(lambda db: _ingest_file_full(db, captured))
-        req.log_errors = True
+        _submit_ingest(path)
 
 
 def _schedule_watches(observer: BaseObserver, roots: list[Path]) -> list[Any]:

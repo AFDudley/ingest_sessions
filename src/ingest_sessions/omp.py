@@ -295,6 +295,71 @@ def reconstruct_conversation_order(
 # ---------------------------------------------------------------------------
 
 
+def _insert_new_records(
+    db: duckdb.DuckDBPyConnection,
+    *,
+    session_id: str,
+    batch: list[tuple[str, str, str, Any, str | None, str]],
+) -> None:
+    """Insert only the rows of *batch* not already stored for *session_id*.
+
+    An omp transcript has no incremental byte-offset support (its header line
+    must be seen on every pass), so every watchdog event re-parses the WHOLE
+    file and arrives here with every row the file has ever held. Handing all
+    of them to ``INSERT OR IGNORE`` looks free but is not: DuckDB executes one
+    statement per row, and each one probes the ``records`` primary-key ART
+    plus the three secondary ARTs (session_id, type, timestamp) over the
+    full-corpus table. Measured on the live 436GB corpus that cost >10s per
+    pass for a 12k-entry transcript against a 0.34s parse -- it monopolised
+    the single DB thread (``server._db_loop``) so completely that inbound MCP
+    queries expired on their bounded wait without ever executing.
+
+    One indexed ``session_id`` lookup answers "which of these do we already
+    have?" in a single scan, leaving only genuinely new rows to insert, so an
+    append-only transcript costs work proportional to what was APPENDED. The
+    result is identical to the unfiltered ``INSERT OR IGNORE``: a uuid already
+    present under this session_id would have been ignored anyway, and a uuid
+    present under a DIFFERENT session_id is not filtered here and still meets
+    ``OR IGNORE`` on the primary key.
+    """
+    existing = {
+        row[0]
+        for row in db.execute(
+            "SELECT uuid FROM records WHERE session_id = ?", [session_id]
+        ).fetchall()
+    }
+    fresh = [row for row in batch if row[0] not in existing]
+    if fresh:
+        db.executemany("INSERT OR IGNORE INTO records VALUES (?, ?, ?, ?, ?, ?)", fresh)
+
+
+def _insert_new_malformed(
+    db: duckdb.DuckDBPyConnection,
+    *,
+    jsonl_path: Path,
+    malformed: list[tuple[str, int, str, int]],
+) -> None:
+    """Insert only the malformed lines not already stored for *jsonl_path*.
+
+    The ``_insert_new_records`` argument applies verbatim: a full re-parse
+    re-offers every malformed line the file has ever held, and the
+    ``malformed_lines`` primary key ``(file_path, byte_offset)`` makes the
+    already-stored ones a no-op that still costs a per-row index probe.
+    """
+    existing = {
+        row[0]
+        for row in db.execute(
+            "SELECT byte_offset FROM malformed_lines WHERE file_path = ?",
+            [str(jsonl_path)],
+        ).fetchall()
+    }
+    fresh = [row for row in malformed if row[1] not in existing]
+    if fresh:
+        db.executemany(
+            "INSERT OR IGNORE INTO malformed_lines VALUES (?, ?, ?, ?)", fresh
+        )
+
+
 def ingest_omp_jsonl(
     db: duckdb.DuckDBPyConnection, jsonl_path: Path
 ) -> tuple[int, int, dict[str, Any] | None]:
@@ -313,6 +378,13 @@ def ingest_omp_jsonl(
     match a recognized SessionEntry kind is counted as malformed and
     skipped -- the ingest never aborts, mirroring
     `core.ingest_jsonl`'s existing non-fatal skip of malformed lines.
+
+    The returned counts are what the FILE holds, not what was written: the
+    whole file is re-parsed on every pass (no byte-offset support -- the
+    header must be seen each time), and `_insert_new_records` /
+    `_insert_new_malformed` write only the rows not already stored, so a
+    re-ingest of an appended-to transcript costs work proportional to the
+    APPEND rather than to the file.
     """
     raw = jsonl_path.read_bytes()
     now_ms = int(time.time() * 1000)
@@ -354,11 +426,9 @@ def ingest_omp_jsonl(
         batch.append(omp_entry_to_record_row(entry, session_id))
 
     if batch:
-        db.executemany("INSERT OR IGNORE INTO records VALUES (?, ?, ?, ?, ?, ?)", batch)
+        _insert_new_records(db, session_id=session_id, batch=batch)
     if malformed:
-        db.executemany(
-            "INSERT OR IGNORE INTO malformed_lines VALUES (?, ?, ?, ?)", malformed
-        )
+        _insert_new_malformed(db, jsonl_path=jsonl_path, malformed=malformed)
     return len(batch), len(malformed), header
 
 
