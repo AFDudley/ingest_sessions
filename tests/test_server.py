@@ -1177,35 +1177,36 @@ def test_summary_antijoin_finds_unembedded_summary():
 
 
 # ---------------------------------------------------------------------------
-# FTS rebuild: off-thread + throttle + repair (pebble is-e10)
+# FTS: off-thread, off the timer, repair (pebble is-e10)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_periodic_sync_throttles_fts_rebuild(tmp_path: Path, monkeypatch):
-    """The throttled (periodic) sweep rebuilds FTS at most once per
-    INGEST_SESSIONS_FTS_MIN_INTERVAL, even though it embeds new records every run.
+async def test_periodic_sync_appends_fts_rows_but_never_snapshots(
+    tmp_path: Path, monkeypatch
+):
+    """The timer keeps record_fts ROWS current and never runs create_fts_index.
 
-    Drives ``_run_sync_async(throttle_fts=True)`` in-process with an INJECTED
-    clock against a real DB thread + real embedding model. Three runs, each with
-    a fresh unembedded record:
-      * t=0     (first, last=None)        -> rebuild.
-      * t=100   (< 3600 since last)       -> THROTTLED, no rebuild.
-      * t=4000  (>= 3600 since last)      -> rebuild.
-    This is the is-e10 decoupling: embedding stays current every cycle, the
-    costly FTS rebuild is bounded.
+    ``create_fts_index`` is one indivisible whole-corpus statement; at corpus
+    scale it exceeds the DB thread's per-op budget and is interrupted, so a
+    timer that schedules it starves every queued query for the budget window
+    and never produces a refreshed index. Measured live: 32 of 47 in-op
+    db-thread samples across two sweeps sat in that PRAGMA, and every sweep
+    failed.
+
+    So each periodic run must append the drifted rows (bounded, committed) and
+    report ``fts_rebuilt`` False, while an EXPLICIT sync takes the snapshot.
+    Driven in-process against a real DB thread + real embedding model.
     """
     import ingest_sessions.server as srv
 
-    monkeypatch.setenv("INGEST_SESSIONS_DB", str(tmp_path / "throttle.duckdb"))
+    monkeypatch.setenv("INGEST_SESSIONS_DB", str(tmp_path / "periodic.duckdb"))
     monkeypatch.setenv("INGEST_SESSIONS_PROJECTS_DIR", str(tmp_path / "projects"))
     (tmp_path / "projects").mkdir()
     monkeypatch.setenv("INGEST_SESSIONS_HISTORY_FILE", str(tmp_path / "history.jsonl"))
-    monkeypatch.setenv("INGEST_SESSIONS_FTS_MIN_INTERVAL", "3600")
 
     srv._startup_done.clear()
     srv._backfill_running = False
-    srv._last_fts_rebuild_at = None
 
     async def _insert(uuid: str, text: str) -> None:
         raw = json.dumps(_record(uuid, text))
@@ -1218,22 +1219,36 @@ async def test_periodic_sync_throttles_fts_rebuild(tmp_path: Path, monkeypatch):
 
         await srv._db_execute(_do)
 
+    async def _fts_rows() -> int:
+        def _do(db) -> int:
+            row = db.execute("SELECT count(*) FROM record_fts").fetchone()
+            return int(row[0]) if row else 0
+
+        return await srv._db_execute(_do)
+
     thread = srv._start_db_thread()
     try:
         await _insert("u-a", "alpha record about database indexing")
-        r1 = await srv._run_sync_async(throttle_fts=True, now=0.0)
+        r1 = await srv._run_sync_async(periodic=True)
         assert r1["embedded"] == 1
-        assert r1["fts_rebuilt"] is True
+        assert r1["fts_rows_added"] == 1
+        assert r1["fts_rebuilt"] is False
+        assert await _fts_rows() == 1
 
         await _insert("u-b", "bravo record about cache eviction")
-        r2 = await srv._run_sync_async(throttle_fts=True, now=100.0)
+        r2 = await srv._run_sync_async(periodic=True)
         assert r2["embedded"] == 1
-        assert r2["fts_rebuilt"] is False  # THROTTLED: within min_interval
+        assert r2["fts_rows_added"] == 1
+        assert r2["fts_rebuilt"] is False
+        assert await _fts_rows() == 2
 
+        # An EXPLICIT sync is where the snapshot gets paid.
         await _insert("u-c", "charlie record about slow queries")
-        r3 = await srv._run_sync_async(throttle_fts=True, now=4000.0)
+        r3 = await srv._run_sync_async()
         assert r3["embedded"] == 1
-        assert r3["fts_rebuilt"] is True  # interval elapsed
+        assert r3["fts_rows_added"] == 1
+        assert r3["fts_rebuilt"] is True
+        assert await _fts_rows() == 3
     finally:
         srv._db_queue.put(None)
         thread.join(timeout=5)
@@ -1245,9 +1260,11 @@ async def test_force_fts_repairs_partial_record_fts(tmp_path: Path):
     record_fts even when no new records need embedding — the is-e10 repair path.
 
     Reproduces the broken prod state (record_fts has fewer rows than records,
-    index stale), proves a plain sync does NOT fix it (0 embedded -> no rebuild),
-    then force_fts=true repairs record_fts to records-count and search works —
-    all through the off-thread _rebuild_fts_async (real subprocess server).
+    index stale). A plain sync now re-APPENDS the missing row — the FTS row arm
+    runs every sweep — but with 0 records embedded it does not pay
+    create_fts_index, so the restored row is present and NOT searchable. That
+    residual is what force_fts=true repairs, through the off-thread
+    _rebuild_fts_async (real subprocess server).
     """
     _write_session(
         tmp_path,
@@ -1274,11 +1291,15 @@ async def test_force_fts_repairs_partial_record_fts(tmp_path: Path):
         )
         assert await _count(client, "record_fts") == 1
 
-        # A plain sync embeds 0 (all already embedded) -> would NOT rebuild.
+        # A plain sync embeds 0 (all already embedded), so it does not pay the
+        # snapshot; its FTS row arm does restore the deleted row.
         plain = json.loads(_text(await client.call_tool("sync", {"wait": True})))
         assert plain["embedded"] == 0
+        assert plain["fts_rows_added"] == 1
         assert plain["fts_rebuilt"] is False
-        assert await _count(client, "record_fts") == 1  # still broken
+        assert await _count(client, "record_fts") == 2  # row back
+        # The BM25 snapshot still predates that row (asserted directly at the
+        # unit level in test_fts_rebuild.py); force_fts is what refreshes it.
 
         # force_fts=true: a clean rebuild despite 0 embedded -> repaired.
         repair = json.loads(

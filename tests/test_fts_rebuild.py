@@ -11,8 +11,8 @@ pieces of the fix at the pure-function level:
   * ``write_fts_index`` — the DELETE+INSERT+create_fts_index now run in ONE
     transaction, so a failure mid-write rolls back to the prior consistent
     ``(record_fts, index)`` state (atomicity by construction).
-  * ``_should_rebuild_fts`` — the pure throttle decision the periodic sweep
-    uses to stop re-triggering the costly rebuild every embedding cycle.
+  * ``_should_snapshot_fts`` — the pure decision that keeps the indivisible
+    ``create_fts_index`` off the periodic timer entirely.
 """
 
 from __future__ import annotations
@@ -278,7 +278,6 @@ def _sync_harness(
     monkeypatch.setattr(srv, "_db_execute", _execute)
     monkeypatch.setattr(srv, "embed_texts", lambda texts: [[0.0] * 384] * len(texts))
     monkeypatch.setattr(srv, "_backfill_running", False)
-    monkeypatch.setattr(srv, "_last_fts_rebuild_at", None)
 
 
 @pytest.mark.asyncio
@@ -298,11 +297,15 @@ async def test_periodic_sync_indexes_new_records_without_rewriting_old_ones(
     write_fts_index(db, [("a", "planted placeholder")])
     _insert(db, _user_record("b", "s2", "configuring the zorblax cache"))
 
-    result = await srv._run_sync_async(throttle_fts=True)
+    result = await srv._run_sync_async(periodic=True)
 
-    assert result["fts_rebuilt"] is True
+    # The row is appended, so the drift is gone and an explicit snapshot is
+    # cheap -- but the timer never pays create_fts_index, so 'b' is not yet
+    # searchable and 'a' keeps the planted text a replace would have rewritten.
+    assert result["fts_rows_added"] == 1
+    assert result["fts_rebuilt"] is False
     assert _fts_count(db) == 2
-    assert [h["uuid"] for h in search_lexical(db, "zorblax")] == ["b"]
+    assert search_lexical(db, "zorblax") == []
     assert [h["uuid"] for h in search_lexical(db, "planted")] == ["a"]
     assert search_lexical(db, "quick") == []
 
@@ -325,91 +328,25 @@ async def test_force_fts_re_derives_every_row(
 
 
 # ---------------------------------------------------------------------------
-# _should_rebuild_fts — the pure throttle decision
+# _should_snapshot_fts — the pure decision keeping create_fts_index off the timer
 # ---------------------------------------------------------------------------
 
 
-def test_should_rebuild_fts_force_always() -> None:
-    # force=True rebuilds even with 0 embedded and within the interval — the
-    # operator repair path.
-    assert (
-        srv._should_rebuild_fts(
-            embedded=0, throttle=True, force=True, now=0.0, last=0.0, min_interval=3600
-        )
-        is True
-    )
+def test_periodic_never_snapshots_even_when_forced() -> None:
+    # The timer must never schedule create_fts_index: it is indivisible and
+    # over the DB thread's per-op budget at corpus scale, so a timer can only
+    # starve queued queries with it, never finish it. Not even force overrides
+    # that -- force reaches the snapshot through an EXPLICIT call.
+    assert srv._should_snapshot_fts(embedded=5, periodic=True, force=False) is False
+    assert srv._should_snapshot_fts(embedded=5, periodic=True, force=True) is False
 
 
-def test_should_rebuild_fts_no_new_records() -> None:
-    # No new record text -> nothing to reindex (unless forced).
-    assert (
-        srv._should_rebuild_fts(
-            embedded=0,
-            throttle=False,
-            force=False,
-            now=10.0,
-            last=None,
-            min_interval=3600,
-        )
-        is False
-    )
+def test_explicit_sync_snapshots_only_when_records_were_embedded() -> None:
+    # An explicit sync pays it when the FTS corpus text actually changed.
+    assert srv._should_snapshot_fts(embedded=5, periodic=False, force=False) is True
+    assert srv._should_snapshot_fts(embedded=0, periodic=False, force=False) is False
 
 
-def test_should_rebuild_fts_manual_not_throttled() -> None:
-    # Manual /api/sync (throttle=False): any new records rebuild, no throttle.
-    assert (
-        srv._should_rebuild_fts(
-            embedded=5,
-            throttle=False,
-            force=False,
-            now=10.0,
-            last=0.0,
-            min_interval=3600,
-        )
-        is True
-    )
-
-
-def test_should_rebuild_fts_throttled_first_time() -> None:
-    # Throttled but never rebuilt this process (last=None) -> rebuild.
-    assert (
-        srv._should_rebuild_fts(
-            embedded=5,
-            throttle=True,
-            force=False,
-            now=10.0,
-            last=None,
-            min_interval=3600,
-        )
-        is True
-    )
-
-
-def test_should_rebuild_fts_throttled_within_interval() -> None:
-    # Throttled, new records, but < min_interval since the last rebuild -> skip.
-    assert (
-        srv._should_rebuild_fts(
-            embedded=5,
-            throttle=True,
-            force=False,
-            now=100.0,
-            last=0.0,
-            min_interval=3600,
-        )
-        is False
-    )
-
-
-def test_should_rebuild_fts_throttled_interval_elapsed() -> None:
-    # Throttled, new records, >= min_interval since the last rebuild -> rebuild.
-    assert (
-        srv._should_rebuild_fts(
-            embedded=5,
-            throttle=True,
-            force=False,
-            now=4000.0,
-            last=0.0,
-            min_interval=3600,
-        )
-        is True
-    )
+def test_force_snapshots_with_nothing_embedded() -> None:
+    # The repair path: rebuild even with 0 embedded, to fix a partial record_fts.
+    assert srv._should_snapshot_fts(embedded=0, periodic=False, force=True) is True
