@@ -1300,13 +1300,18 @@ async def test_force_fts_repairs_partial_record_fts(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_periodic_sync_eventually_embeds_new_records(tmp_path: Path):
-    """The background driver embeds newly-ingested records within one interval.
+    """The background driver embeds and indexes new records within one interval.
 
     Start the server with a 1s sync interval and a seeded corpus. The startup
-    ingestion writes raw rows but NOT embeddings; the periodic driver fires and
-    fills them in. Polling proves eventual consistency by construction and that
-    the fire-and-forget task runs (and is cancelled cleanly on shutdown — the
-    context manager exit would hang otherwise).
+    ingestion writes raw rows but NEITHER embeddings NOR FTS rows; the periodic
+    driver fires and fills both in. Polling proves eventual consistency by
+    construction and that the fire-and-forget task runs (and is cancelled
+    cleanly on shutdown — the context manager exit would hang otherwise).
+
+    Both sidecars are polled to the SAME deadline. Sampling record_fts once,
+    the instant record_embeddings reached 2, raced the sweep: the embeddings
+    land first and the FTS arm runs after them, so the single sample caught a
+    still-empty record_fts whenever the machine was loaded.
     """
     _write_session(
         tmp_path,
@@ -1323,13 +1328,15 @@ async def test_periodic_sync_eventually_embeds_new_records(tmp_path: Path):
     ):
         deadline = time.monotonic() + 60
         embedded = 0
+        indexed = 0
         while time.monotonic() < deadline:
             embedded = await _count(client, "record_embeddings")
-            if embedded == 2:
+            indexed = await _count(client, "record_fts")
+            if embedded == 2 and indexed == 2:
                 break
             await asyncio.sleep(0.5)
         assert embedded == 2
-        assert await _count(client, "record_fts") == 2
+        assert indexed == 2
 
 
 @pytest.mark.asyncio

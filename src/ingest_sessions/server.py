@@ -76,10 +76,11 @@ from ingest_sessions.core import (
     ingest_history,
     ingest_routed_file,
     ingest_session_metadata,
-    extend_fts_index,
+    append_fts_rows,
     fetch_record_raws,
     fetch_unindexed_record_raws,
     project_record_texts,
+    rebuild_fts_snapshot,
     record_file,
     register_functions,
     resolve_discovery_roots,
@@ -534,27 +535,34 @@ async def _rebuild_fts_async(*, chunk_size: int = 5000) -> int:
     return await _db_execute(partial(write_fts_index, projection=projection))
 
 
-async def _extend_fts_async(*, chunk_size: int = 5000) -> int:
+async def _extend_fts_async(*, batch_size: int = 2000) -> int:
     """Bring the BM25 FTS index up to date by indexing only the NEW records.
 
     The periodic sweep's form of :func:`_rebuild_fts_async`, and the reason the
-    sweep terminates: phases 1 and 2 run over the anti-join
-    (:func:`core.fetch_unindexed_record_raws`) rather than the whole corpus, and
-    phase 3 inserts only those rows (:func:`core.extend_fts_index`), so the work
-    is proportional to what was ingested since the last pass instead of to the
-    corpus. ``records`` is append-only and the projection is pure, so the rows
-    skipped are already byte-identical to what a replace would write.
+    sweep terminates. It mirrors the embedding arm exactly: fetch a bounded
+    batch of records ``record_fts`` lacks, project it OFF the DB thread, write
+    it back, yield, repeat until the anti-join is empty. Every batch is
+    COMMITTED (:func:`core.append_fts_rows`), so the population shrinks by
+    exactly what was written and an interrupt costs one batch instead of the
+    whole pass -- the failure mode that made the old whole-corpus refresh
+    re-do everything, forever, and index nothing.
+
+    ``records`` is append-only and the projection is pure, so the rows the
+    anti-join skips are already byte-identical to what a replace would write.
+    The single whole-corpus step left is the ``create_fts_index`` snapshot
+    (:func:`core.rebuild_fts_snapshot`), taken once at the end.
 
     Returns the resulting indexed row count.
     """
-    rows = await _db_execute(fetch_unindexed_record_raws)
-    projection: list[tuple[str, str]] = []
-    for start in range(0, len(rows), chunk_size):
-        chunk = rows[start : start + chunk_size]
-        projection.extend(await asyncio.to_thread(project_record_texts, chunk))
-        # Yield so queued requests interleave between parse chunks.
+    while True:
+        rows = await _db_execute(partial(fetch_unindexed_record_raws, limit=batch_size))
+        if not rows:
+            break
+        projection = await asyncio.to_thread(project_record_texts, rows)
+        await _db_execute(partial(append_fts_rows, projection=projection))
+        # Yield so queued requests interleave between batches.
         await asyncio.sleep(0)
-    return await _db_execute(partial(extend_fts_index, projection=projection))
+    return await _db_execute(rebuild_fts_snapshot)
 
 
 def _max_embedded_uuid(db: duckdb.DuckDBPyConnection) -> str:

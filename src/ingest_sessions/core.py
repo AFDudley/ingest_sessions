@@ -133,7 +133,9 @@ def fetch_record_raws(db: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
     return db.execute("SELECT uuid, raw FROM records").fetchall()
 
 
-def fetch_unindexed_record_raws(db: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
+def fetch_unindexed_record_raws(
+    db: duckdb.DuckDBPyConnection, *, limit: int | None = None
+) -> list[tuple[str, str]]:
     """The ``(uuid, raw)`` rows in ``records`` that ``record_fts`` lacks.
 
     The incremental counterpart of :func:`fetch_record_raws`. ``records`` is
@@ -141,14 +143,20 @@ def fetch_unindexed_record_raws(db: duckdb.DuckDBPyConnection) -> list[tuple[str
     already in ``record_fts`` is byte-identical to what a full rebuild would
     write for it: only the drift needs fetching, parsing and inserting. On the
     live corpus that is the difference between 5.47GB / 1.5M rows every pass
-    and the few thousand records ingested since the last pass -- see
-    :func:`extend_fts_index`.
+    and the few thousand records ingested since the last pass.
+
+    *limit* bounds one pass so the caller can drain in batches
+    (:func:`append_fts_rows` commits each one, so the anti-join shrinks by
+    exactly that batch and the drain terminates).
     """
-    return db.execute(
+    sql = (
         "SELECT r.uuid, r.raw FROM records r "
         "LEFT JOIN record_fts f ON r.uuid = f.uuid "
         "WHERE f.uuid IS NULL"
-    ).fetchall()
+    )
+    if limit is None:
+        return db.execute(sql).fetchall()
+    return db.execute(f"{sql} LIMIT ?", [limit]).fetchall()
 
 
 def project_record_texts(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -201,42 +209,49 @@ def write_fts_index(
     return len(projection)
 
 
-def extend_fts_index(
+def append_fts_rows(
     db: duckdb.DuckDBPyConnection, projection: list[tuple[str, str]]
 ) -> int:
-    """Add *projection* to ``record_fts`` and rebuild the BM25 index. Atomic.
+    """Add *projection* to ``record_fts``. Committed; does NOT touch the index.
 
-    The incremental counterpart of :func:`write_fts_index`, and the ONLY form
-    the periodic sweep may use. The full-replace form re-writes all 1.5M rows
-    on every pass, and once that write stopped fitting the DB thread's per-op
-    budget it was interrupted, rolled back, and -- because the throttle clock
-    only advances on success -- retried on the very next sweep, forever: an
-    unbounded op re-attempted indefinitely, each attempt burning a full-corpus
-    fetch + projection (~30GB RSS) that it then discarded, and blocking every
-    queued query for the budget window. Inserting only the drift keeps the
-    write proportional to what arrived.
+    The periodic sweep's write step, deliberately split from
+    :func:`rebuild_fts_snapshot`. Bundling the two into one transaction (as
+    :func:`write_fts_index` must, because it DELETEs first) made a single op
+    whose cost was insert + whole-corpus index build; over the DB thread's
+    per-op budget it was interrupted and rolled back, so the anti-join
+    population never shrank and the next sweep re-did the same work forever.
+    Committing each batch on its own makes progress monotonic: the rows are in
+    ``record_fts``, the anti-join no longer returns them, and an interrupt
+    costs one batch rather than the whole drain.
 
-    DuckDB's FTS index is still a SNAPSHOT with no incremental update, so
-    ``PRAGMA create_fts_index(overwrite=1)`` must re-run over the whole table
-    -- that single indivisible op is what the ``INGEST_SESSIONS_FTS_MIN_INTERVAL``
-    throttle exists to ration. Insert + index rebuild share ONE transaction, so
-    an interrupt rolls back to the prior consistent ``(record_fts, index)``
-    pair, never a table that has rows the index does not know about.
+    Splitting is safe in this direction only. ``record_fts`` grows, never
+    shrinks, so an index snapshot taken before these rows exist covers a
+    SUBSET of the table -- BM25 hits still resolve, results are merely
+    incomplete until the next snapshot. The is-e10 hazard is the opposite
+    order (a partial table under a fuller index, leaving hits that resolve to
+    nothing), which only the DELETE-first replace can produce and which
+    :func:`write_fts_index` still guards transactionally.
 
-    Returns the resulting ``record_fts`` row count.
+    Returns the number of rows written.
     """
-    db.execute("BEGIN TRANSACTION")
-    try:
-        if projection:
-            db.executemany(
-                "INSERT OR REPLACE INTO record_fts VALUES (?, ?)", projection
-            )
-        db.execute("PRAGMA create_fts_index('record_fts', 'uuid', 'text', overwrite=1)")
-        row = db.execute("SELECT count(*) FROM record_fts").fetchone()
-        db.execute("COMMIT")
-    except Exception:
-        db.execute("ROLLBACK")
-        raise
+    if projection:
+        db.executemany("INSERT OR REPLACE INTO record_fts VALUES (?, ?)", projection)
+    return len(projection)
+
+
+def rebuild_fts_snapshot(db: duckdb.DuckDBPyConnection) -> int:
+    """Rebuild the BM25 index over ``record_fts`` as it currently stands.
+
+    DuckDB's FTS index is a SNAPSHOT with no incremental update, so making
+    newly-appended rows searchable means re-running ``create_fts_index`` over
+    the whole table. It is indivisible -- the one whole-corpus step the
+    incremental path cannot decompose -- which is what the
+    ``INGEST_SESSIONS_FTS_MIN_INTERVAL`` throttle exists to ration.
+
+    Returns the indexed row count.
+    """
+    db.execute("PRAGMA create_fts_index('record_fts', 'uuid', 'text', overwrite=1)")
+    row = db.execute("SELECT count(*) FROM record_fts").fetchone()
     return row[0] if row else 0
 
 

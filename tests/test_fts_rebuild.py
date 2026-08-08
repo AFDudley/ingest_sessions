@@ -24,11 +24,12 @@ import pytest
 
 import ingest_sessions.server as srv
 from ingest_sessions.core import (
-    extend_fts_index,
+    append_fts_rows,
     fetch_record_raws,
     fetch_unindexed_record_raws,
     project_record_texts,
     rebuild_fts_index,
+    rebuild_fts_snapshot,
     write_fts_index,
 )
 from ingest_sessions.embeddings import record_text
@@ -154,12 +155,13 @@ def test_write_fts_index_empty_projection(db: duckdb.DuckDBPyConnection) -> None
 
 
 # ---------------------------------------------------------------------------
-# extend_fts_index — the incremental refresh the periodic sweep uses
+# append_fts_rows / rebuild_fts_snapshot — the incremental refresh the sweep uses
 #
-# The full REPLACE form re-writes every row on every pass. Once that write
-# stopped fitting the DB thread's per-op budget it was interrupted, rolled
-# back, and retried on the next sweep forever, burning a whole-corpus fetch +
-# projection each time. The sweep must therefore index only the drift.
+# The full REPLACE form re-writes every row on every pass, and bundles that
+# write with the whole-corpus create_fts_index into ONE op. Over the DB
+# thread's per-op budget it was interrupted, rolled back, and retried on the
+# next sweep forever: the drift never shrank and nothing was ever indexed. The
+# sweep must instead drain the drift in COMMITTED batches, then snapshot once.
 # ---------------------------------------------------------------------------
 
 
@@ -173,51 +175,86 @@ def test_fetch_unindexed_returns_only_records_missing_from_fts(
     assert [uuid for uuid, _raw in fetch_unindexed_record_raws(db)] == ["b"]
 
 
-def test_extend_fts_index_adds_new_rows_and_keeps_old_ones_searchable(
+def test_fetch_unindexed_respects_the_batch_limit(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert(
+        db,
+        _user_record("a", "s1", "one"),
+        _user_record("b", "s2", "two"),
+        _user_record("c", "s3", "three"),
+    )
+    assert len(fetch_unindexed_record_raws(db, limit=2)) == 2
+
+
+def test_appended_rows_are_committed_so_the_drift_shrinks(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Each batch leaves the anti-join permanently smaller.
+
+    This is the termination property: if the write were rolled into the same
+    transaction as the index snapshot, an over-budget interrupt would undo it
+    and the next pass would re-select the same rows indefinitely.
+    """
+    _insert(
+        db,
+        _user_record("a", "s1", "one"),
+        _user_record("b", "s2", "two"),
+        _user_record("c", "s3", "three"),
+    )
+
+    batch = fetch_unindexed_record_raws(db, limit=2)
+    assert append_fts_rows(db, project_record_texts(batch)) == 2
+    assert [uuid for uuid, _raw in fetch_unindexed_record_raws(db)] == ["c"]
+
+    batch = fetch_unindexed_record_raws(db, limit=2)
+    assert append_fts_rows(db, project_record_texts(batch)) == 1
+    assert fetch_unindexed_record_raws(db) == []
+
+
+def test_snapshot_after_append_makes_new_and_old_rows_searchable(
     db: duckdb.DuckDBPyConnection,
 ) -> None:
     _insert(db, _user_record("a", "s1", "the quick brown fox"))
     write_fts_index(db, project_record_texts(fetch_record_raws(db)))
 
     _insert(db, _user_record("b", "s2", "configuring the zorblax cache"))
-    total = extend_fts_index(db, project_record_texts(fetch_unindexed_record_raws(db)))
+    append_fts_rows(db, project_record_texts(fetch_unindexed_record_raws(db)))
 
-    assert total == 2
-    assert _fts_count(db) == 2
+    assert rebuild_fts_snapshot(db) == 2
     assert [h["uuid"] for h in search_lexical(db, "zorblax")] == ["b"]
     assert [h["uuid"] for h in search_lexical(db, "quick")] == ["a"]
 
 
-def test_extend_fts_index_with_nothing_new_still_leaves_the_index_usable(
+def test_appending_without_a_snapshot_leaves_old_hits_resolvable(
     db: duckdb.DuckDBPyConnection,
 ) -> None:
-    _insert(db, _user_record("a", "s1", "the quick brown fox"))
-    write_fts_index(db, project_record_texts(fetch_record_raws(db)))
+    """Appending alone never produces a hit that resolves to nothing.
 
-    assert extend_fts_index(db, []) == 1
-    assert [h["uuid"] for h in search_lexical(db, "quick")] == ["a"]
-
-
-def test_extend_fts_index_rolls_back_on_failure(
-    db: duckdb.DuckDBPyConnection,
-) -> None:
-    """Insert + create_fts_index share one transaction, as the replace form does.
-
-    Without it an interrupted extend would leave `record_fts` holding rows the
-    BM25 index snapshot does not know about — the inconsistency is-e10 made
-    unrepresentable for the replace path, which the incremental path must not
-    reintroduce. Forced with a projection whose row is not a 2-tuple, so the
-    INSERT fails after the transaction has opened.
+    record_fts only grows, so an index built before the append covers a subset
+    of the table: results are incomplete until the next snapshot, never
+    dangling. That asymmetry is what makes splitting the write from the
+    snapshot safe, where the DELETE-first replace must stay transactional.
     """
     _insert(db, _user_record("a", "s1", "the quick brown fox"))
     write_fts_index(db, project_record_texts(fetch_record_raws(db)))
 
-    with pytest.raises(duckdb.Error):
-        extend_fts_index(db, [("b", "wibble wobble", "extra column")])  # type: ignore[list-item]
+    _insert(db, _user_record("b", "s2", "configuring the zorblax cache"))
+    append_fts_rows(db, project_record_texts(fetch_unindexed_record_raws(db)))
 
-    assert _fts_count(db) == 1
     assert [h["uuid"] for h in search_lexical(db, "quick")] == ["a"]
-    assert search_lexical(db, "wibble") == []
+    assert search_lexical(db, "zorblax") == []
+
+
+def test_snapshot_with_nothing_appended_leaves_the_index_usable(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert(db, _user_record("a", "s1", "the quick brown fox"))
+    write_fts_index(db, project_record_texts(fetch_record_raws(db)))
+
+    assert append_fts_rows(db, []) == 0
+    assert rebuild_fts_snapshot(db) == 1
+    assert [h["uuid"] for h in search_lexical(db, "quick")] == ["a"]
 
 
 # ---------------------------------------------------------------------------
