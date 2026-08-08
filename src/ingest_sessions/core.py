@@ -133,6 +133,24 @@ def fetch_record_raws(db: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
     return db.execute("SELECT uuid, raw FROM records").fetchall()
 
 
+def fetch_unindexed_record_raws(db: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
+    """The ``(uuid, raw)`` rows in ``records`` that ``record_fts`` lacks.
+
+    The incremental counterpart of :func:`fetch_record_raws`. ``records`` is
+    append-only and the projection is a pure function of ``raw``, so a row
+    already in ``record_fts`` is byte-identical to what a full rebuild would
+    write for it: only the drift needs fetching, parsing and inserting. On the
+    live corpus that is the difference between 5.47GB / 1.5M rows every pass
+    and the few thousand records ingested since the last pass -- see
+    :func:`extend_fts_index`.
+    """
+    return db.execute(
+        "SELECT r.uuid, r.raw FROM records r "
+        "LEFT JOIN record_fts f ON r.uuid = f.uuid "
+        "WHERE f.uuid IS NULL"
+    ).fetchall()
+
+
 def project_record_texts(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """Project ``(uuid, raw_json)`` rows to ``(uuid, flattened_text)`` (pure).
 
@@ -181,6 +199,45 @@ def write_fts_index(
         db.execute("ROLLBACK")
         raise
     return len(projection)
+
+
+def extend_fts_index(
+    db: duckdb.DuckDBPyConnection, projection: list[tuple[str, str]]
+) -> int:
+    """Add *projection* to ``record_fts`` and rebuild the BM25 index. Atomic.
+
+    The incremental counterpart of :func:`write_fts_index`, and the ONLY form
+    the periodic sweep may use. The full-replace form re-writes all 1.5M rows
+    on every pass, and once that write stopped fitting the DB thread's per-op
+    budget it was interrupted, rolled back, and -- because the throttle clock
+    only advances on success -- retried on the very next sweep, forever: an
+    unbounded op re-attempted indefinitely, each attempt burning a full-corpus
+    fetch + projection (~30GB RSS) that it then discarded, and blocking every
+    queued query for the budget window. Inserting only the drift keeps the
+    write proportional to what arrived.
+
+    DuckDB's FTS index is still a SNAPSHOT with no incremental update, so
+    ``PRAGMA create_fts_index(overwrite=1)`` must re-run over the whole table
+    -- that single indivisible op is what the ``INGEST_SESSIONS_FTS_MIN_INTERVAL``
+    throttle exists to ration. Insert + index rebuild share ONE transaction, so
+    an interrupt rolls back to the prior consistent ``(record_fts, index)``
+    pair, never a table that has rows the index does not know about.
+
+    Returns the resulting ``record_fts`` row count.
+    """
+    db.execute("BEGIN TRANSACTION")
+    try:
+        if projection:
+            db.executemany(
+                "INSERT OR REPLACE INTO record_fts VALUES (?, ?)", projection
+            )
+        db.execute("PRAGMA create_fts_index('record_fts', 'uuid', 'text', overwrite=1)")
+        row = db.execute("SELECT count(*) FROM record_fts").fetchone()
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return row[0] if row else 0
 
 
 def rebuild_fts_index(db: duckdb.DuckDBPyConnection) -> int:

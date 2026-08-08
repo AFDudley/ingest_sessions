@@ -76,7 +76,9 @@ from ingest_sessions.core import (
     ingest_history,
     ingest_routed_file,
     ingest_session_metadata,
+    extend_fts_index,
     fetch_record_raws,
+    fetch_unindexed_record_raws,
     project_record_texts,
     record_file,
     register_functions,
@@ -441,6 +443,17 @@ _backfill_running: bool = False
 # parse, but NOT zero (see the docstring; create_fts_index over a large corpus
 # is itself a multi-second-to-minutes DB-thread cost that throttling bounds but
 # cannot eliminate).
+#
+# Splitting the phases was not enough. At 1.5M records / 5.47GB the full
+# REPLACE rebuild's own write phase stopped fitting the per-op interrupt
+# budget, and since the throttle clock only advances on success, an
+# interrupted rebuild was retried on the very next sweep — a full-corpus fetch
+# + projection burned and discarded every few minutes, indefinitely. So the
+# periodic sweep no longer replaces: _extend_fts_async fetches, projects and
+# inserts only the records `record_fts` is MISSING (append-only corpus, pure
+# projection ⇒ existing rows are already correct), leaving create_fts_index as
+# the only whole-corpus step. The full replace stays on the operator repair
+# path (force_fts / backfill), where blocking is the point.
 # ---------------------------------------------------------------------------
 
 # Monotonic time of the last successful FTS rebuild ('None' = never this
@@ -492,7 +505,13 @@ def _should_rebuild_fts(
 
 
 async def _rebuild_fts_async(*, chunk_size: int = 5000) -> int:
-    """Rebuild the BM25 FTS index with the expensive parse OFF the DB thread.
+    """REPLACE the BM25 FTS index, with the expensive parse OFF the DB thread.
+
+    The operator repair path (``force_fts`` / ``backfill``): it re-derives
+    every row, so it also repairs a ``record_fts`` that drifted from ``records``
+    by anything other than pure append. The periodic sweep uses
+    :func:`_extend_fts_async` instead — this form's whole-corpus write cannot
+    be kept inside the DB thread's per-op budget at scale.
 
     Three phases (pebble is-e10):
       1. DB thread (fast): fetch every ``(uuid, raw)`` from ``records``.
@@ -503,10 +522,7 @@ async def _rebuild_fts_async(*, chunk_size: int = 5000) -> int:
       3. DB thread (atomic): DELETE + INSERT + ``create_fts_index`` in ONE
          transaction (:func:`core.write_fts_index`).
 
-    Returns the indexed row count. The DB thread is touched only by the fetch
-    and the transactional write; the multi-minute Python parse no longer blocks
-    it. The create_fts_index C++ build in phase 3 is the residual DB-thread
-    block — far smaller than the parse, throttled (not eliminated) at scale.
+    Returns the indexed row count.
     """
     rows = await _db_execute(fetch_record_raws)
     projection: list[tuple[str, str]] = []
@@ -516,6 +532,29 @@ async def _rebuild_fts_async(*, chunk_size: int = 5000) -> int:
         # Yield so queued requests interleave between parse chunks.
         await asyncio.sleep(0)
     return await _db_execute(partial(write_fts_index, projection=projection))
+
+
+async def _extend_fts_async(*, chunk_size: int = 5000) -> int:
+    """Bring the BM25 FTS index up to date by indexing only the NEW records.
+
+    The periodic sweep's form of :func:`_rebuild_fts_async`, and the reason the
+    sweep terminates: phases 1 and 2 run over the anti-join
+    (:func:`core.fetch_unindexed_record_raws`) rather than the whole corpus, and
+    phase 3 inserts only those rows (:func:`core.extend_fts_index`), so the work
+    is proportional to what was ingested since the last pass instead of to the
+    corpus. ``records`` is append-only and the projection is pure, so the rows
+    skipped are already byte-identical to what a replace would write.
+
+    Returns the resulting indexed row count.
+    """
+    rows = await _db_execute(fetch_unindexed_record_raws)
+    projection: list[tuple[str, str]] = []
+    for start in range(0, len(rows), chunk_size):
+        chunk = rows[start : start + chunk_size]
+        projection.extend(await asyncio.to_thread(project_record_texts, chunk))
+        # Yield so queued requests interleave between parse chunks.
+        await asyncio.sleep(0)
+    return await _db_execute(partial(extend_fts_index, projection=projection))
 
 
 def _max_embedded_uuid(db: duckdb.DuckDBPyConnection) -> str:
@@ -726,19 +765,23 @@ async def _run_sync_async(
     anti-join below, summaries via ``_sync_summary_embeddings``. The HNSW vector
     indexes stay in place (incremental inserts) so search keeps working.
 
-    The FTS rebuild (the expensive snapshot refresh) is gated by
-    :func:`_should_rebuild_fts` (pebble is-e10):
+    The FTS refresh is gated by :func:`_should_rebuild_fts` (pebble is-e10):
 
-    - ``throttle_fts`` (the periodic ``_sync_loop``): rebuild iff this run
+    - ``throttle_fts`` (the periodic ``_sync_loop``): refresh iff this run
       embedded RECORD rows AND ``INGEST_SESSIONS_FTS_MIN_INTERVAL`` has elapsed
-      since the last rebuild — so a 5-min embedding cadence does not re-trigger
-      the costly rebuild every cycle.
-    - default / manual ``/api/sync`` (``throttle_fts=False``): rebuild iff this
+      since the last one — so a 5-min embedding cadence does not re-trigger
+      the costly ``create_fts_index`` every cycle.
+    - default / manual ``/api/sync`` (``throttle_fts=False``): refresh iff this
       run embedded RECORD rows (the pre-is-e10 contract, no throttle).
-    - ``force_fts``: always rebuild (operator repair path).
+    - ``force_fts``: always refresh (operator repair path).
 
-    The rebuild itself runs OFF the DB thread (``_rebuild_fts_async``). ``now``
-    is injectable for deterministic throttle tests (defaults to ``monotonic``).
+    WHICH refresh depends on ``force_fts``: the repair path re-derives the
+    whole corpus (``_rebuild_fts_async``), everything else indexes only the
+    records ``record_fts`` is missing (``_extend_fts_async``). Both run their
+    parse OFF the DB thread; only the incremental form keeps its DB-thread
+    write proportional to the drift, which is what stops an over-budget
+    rebuild from being re-attempted every sweep forever. ``now`` is injectable
+    for deterministic throttle tests (defaults to ``monotonic``).
     """
     global _backfill_running, _last_fts_rebuild_at
     if _backfill_running:
@@ -777,7 +820,10 @@ async def _run_sync_async(
             last=_last_fts_rebuild_at,
             min_interval=_fts_min_interval(),
         ):
-            await _rebuild_fts_async()
+            if force_fts:
+                await _rebuild_fts_async()
+            else:
+                await _extend_fts_async()
             _last_fts_rebuild_at = clock
             fts_rebuilt = True
         return {

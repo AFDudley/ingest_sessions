@@ -24,7 +24,9 @@ import pytest
 
 import ingest_sessions.server as srv
 from ingest_sessions.core import (
+    extend_fts_index,
     fetch_record_raws,
+    fetch_unindexed_record_raws,
     project_record_texts,
     rebuild_fts_index,
     write_fts_index,
@@ -149,6 +151,140 @@ def test_write_fts_index_empty_projection(db: duckdb.DuckDBPyConnection) -> None
     assert write_fts_index(db, []) == 0
     assert _fts_count(db) == 0
     assert search_lexical(db, "anything") == []
+
+
+# ---------------------------------------------------------------------------
+# extend_fts_index — the incremental refresh the periodic sweep uses
+#
+# The full REPLACE form re-writes every row on every pass. Once that write
+# stopped fitting the DB thread's per-op budget it was interrupted, rolled
+# back, and retried on the next sweep forever, burning a whole-corpus fetch +
+# projection each time. The sweep must therefore index only the drift.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_unindexed_returns_only_records_missing_from_fts(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert(db, _user_record("a", "s1", "the quick brown fox"))
+    write_fts_index(db, project_record_texts(fetch_record_raws(db)))
+
+    _insert(db, _user_record("b", "s2", "configuring the zorblax cache"))
+    assert [uuid for uuid, _raw in fetch_unindexed_record_raws(db)] == ["b"]
+
+
+def test_extend_fts_index_adds_new_rows_and_keeps_old_ones_searchable(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert(db, _user_record("a", "s1", "the quick brown fox"))
+    write_fts_index(db, project_record_texts(fetch_record_raws(db)))
+
+    _insert(db, _user_record("b", "s2", "configuring the zorblax cache"))
+    total = extend_fts_index(db, project_record_texts(fetch_unindexed_record_raws(db)))
+
+    assert total == 2
+    assert _fts_count(db) == 2
+    assert [h["uuid"] for h in search_lexical(db, "zorblax")] == ["b"]
+    assert [h["uuid"] for h in search_lexical(db, "quick")] == ["a"]
+
+
+def test_extend_fts_index_with_nothing_new_still_leaves_the_index_usable(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    _insert(db, _user_record("a", "s1", "the quick brown fox"))
+    write_fts_index(db, project_record_texts(fetch_record_raws(db)))
+
+    assert extend_fts_index(db, []) == 1
+    assert [h["uuid"] for h in search_lexical(db, "quick")] == ["a"]
+
+
+def test_extend_fts_index_rolls_back_on_failure(
+    db: duckdb.DuckDBPyConnection,
+) -> None:
+    """Insert + create_fts_index share one transaction, as the replace form does.
+
+    Without it an interrupted extend would leave `record_fts` holding rows the
+    BM25 index snapshot does not know about — the inconsistency is-e10 made
+    unrepresentable for the replace path, which the incremental path must not
+    reintroduce. Forced with a projection whose row is not a 2-tuple, so the
+    INSERT fails after the transaction has opened.
+    """
+    _insert(db, _user_record("a", "s1", "the quick brown fox"))
+    write_fts_index(db, project_record_texts(fetch_record_raws(db)))
+
+    with pytest.raises(duckdb.Error):
+        extend_fts_index(db, [("b", "wibble wobble", "extra column")])  # type: ignore[list-item]
+
+    assert _fts_count(db) == 1
+    assert [h["uuid"] for h in search_lexical(db, "quick")] == ["a"]
+    assert search_lexical(db, "wibble") == []
+
+
+# ---------------------------------------------------------------------------
+# _run_sync_async — which refresh each caller gets
+# ---------------------------------------------------------------------------
+
+
+def _sync_harness(
+    db: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run `_run_sync_async`'s DB ops inline against *db*, with embedding stubbed.
+
+    The sweep's embedding arm is irrelevant here and would load ~180MB of ONNX;
+    only its "did anything change?" signal matters, because that is what gates
+    the FTS refresh.
+    """
+
+    async def _execute(fn):  # type: ignore[no-untyped-def]
+        return fn(db)
+
+    monkeypatch.setattr(srv, "_db_execute", _execute)
+    monkeypatch.setattr(srv, "embed_texts", lambda texts: [[0.0] * 384] * len(texts))
+    monkeypatch.setattr(srv, "_backfill_running", False)
+    monkeypatch.setattr(srv, "_last_fts_rebuild_at", None)
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_indexes_new_records_without_rewriting_old_ones(
+    db: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-force sweep adds the missing record and leaves indexed rows alone.
+
+    'a' is deliberately indexed under text that does NOT match its projection.
+    A full replace would re-derive and overwrite it; the incremental refresh
+    the sweep must use skips every uuid already in `record_fts`, so the
+    planted text survives. That is the observable difference between the two
+    refresh forms.
+    """
+    _sync_harness(db, monkeypatch)
+    _insert(db, _user_record("a", "s1", "the quick brown fox"))
+    write_fts_index(db, [("a", "planted placeholder")])
+    _insert(db, _user_record("b", "s2", "configuring the zorblax cache"))
+
+    result = await srv._run_sync_async(throttle_fts=True)
+
+    assert result["fts_rebuilt"] is True
+    assert _fts_count(db) == 2
+    assert [h["uuid"] for h in search_lexical(db, "zorblax")] == ["b"]
+    assert [h["uuid"] for h in search_lexical(db, "planted")] == ["a"]
+    assert search_lexical(db, "quick") == []
+
+
+@pytest.mark.asyncio
+async def test_force_fts_re_derives_every_row(
+    db: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """force_fts stays the repair path: it rewrites rows the extend would skip."""
+    _sync_harness(db, monkeypatch)
+    _insert(db, _user_record("a", "s1", "the quick brown fox"))
+    write_fts_index(db, [("a", "planted placeholder")])
+
+    result = await srv._run_sync_async(force_fts=True)
+
+    assert result["fts_rebuilt"] is True
+    assert _fts_count(db) == 1
+    assert [h["uuid"] for h in search_lexical(db, "quick")] == ["a"]
+    assert search_lexical(db, "planted") == []
 
 
 # ---------------------------------------------------------------------------
