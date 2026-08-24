@@ -80,14 +80,30 @@ def _rerank_onnx(query: str, documents: list[str]) -> list[float]:
     return [float(score) for score in model.rerank(query, documents)]
 
 
+# The fastembed/onnxruntime tokenizer truncates the query/document pair to
+# the model's max sequence length (512 tokens) silently. vLLM's HTTP
+# endpoint does not: it validates length and returns 400. These are
+# conservative char budgets (~2.7 chars/token) leaving room for both
+# sequences plus special tokens, so the vLLM path matches the onnx path's
+# behavior on the long record text this corpus actually holds.
+_RERANK_MAX_QUERY_CHARS = 200
+_RERANK_MAX_DOC_CHARS = 1100
+
+
 def _rerank_vllm(query: str, documents: list[str]) -> list[float]:
     """Score via a vLLM ``/score`` endpoint (env ``INGEST_SESSIONS_RERANK_ENGINE=vllm``).
 
     Raises on any transport or protocol error — callers get a clear failure
     rather than a silent fall back to a different scorer.
     """
+    truncated_query = query[:_RERANK_MAX_QUERY_CHARS]
+    truncated_docs = [d[:_RERANK_MAX_DOC_CHARS] for d in documents]
     body = json.dumps(
-        {"model": _rerank_model_name(), "text_1": query, "text_2": documents}
+        {
+            "model": _rerank_model_name(),
+            "text_1": truncated_query,
+            "text_2": truncated_docs,
+        }
     ).encode()
     req = urllib.request.Request(
         _rerank_url(),

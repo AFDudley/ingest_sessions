@@ -91,13 +91,23 @@ def _embed_texts_onnx(texts: list[str]) -> list[list[float]]:
     return [[float(x) for x in vec] for vec in model.embed(texts)]
 
 
+# The fastembed/onnxruntime tokenizer truncates input to the model's max
+# sequence length (256 tokens for this model) silently, before embedding.
+# vLLM's HTTP endpoint does not: it validates length and returns 400. This
+# is a conservative char budget (~2.7 chars/token, safe for dense code/JSON
+# text as well as prose) so the vLLM path matches the onnx path's behavior
+# instead of erroring on the long record text this corpus actually holds.
+_EMBED_MAX_CHARS = 690
+
+
 def _embed_texts_vllm(texts: list[str]) -> list[list[float]]:
     """Embed via a vLLM ``/v1/embeddings`` endpoint (env ``INGEST_SESSIONS_EMBED_ENGINE=vllm``).
 
     Raises on any transport or protocol error — callers get a clear failure
     rather than a silent fall back to the wrong vector space.
     """
-    body = json.dumps({"model": _embed_model_name(), "input": texts}).encode()
+    truncated = [t[:_EMBED_MAX_CHARS] for t in texts]
+    body = json.dumps({"model": _embed_model_name(), "input": truncated}).encode()
     req = urllib.request.Request(
         _embed_url(),
         data=body,
