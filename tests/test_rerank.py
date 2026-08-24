@@ -12,10 +12,11 @@ from __future__ import annotations
 import json
 
 import duckdb
+import pytest
 
 from ingest_sessions.core import rebuild_fts_index
 from ingest_sessions.embeddings import backfill_embeddings
-from ingest_sessions.rerank import RERANK_MODEL, rerank
+from ingest_sessions.rerank import RERANK_MODEL, _rerank_engine, rerank
 from ingest_sessions.retrieval import retrieve_relevant
 
 
@@ -129,3 +130,100 @@ def test_retrieve_relevant_bounded_by_k(db: duckdb.DuckDBPyConnection) -> None:
 def test_retrieve_relevant_empty_corpus(db: duckdb.DuckDBPyConnection) -> None:
     # No records, no indexes: must return [] gracefully (no rerank call).
     assert retrieve_relevant(db, "anything") == []
+
+
+# ---------------------------------------------------------------------------
+# engine selection (env INGEST_SESSIONS_RERANK_ENGINE) — mocked HTTP, no live
+# vLLM server required. See rerank.py's docstring for the equivalence check
+# run against a real GPU server: scores agree to ~0.004 logit units and rank
+# order is identical to fastembed's ONNX output on matched inputs.
+# ---------------------------------------------------------------------------
+
+
+def test_rerank_engine_defaults_to_onnx(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("INGEST_SESSIONS_RERANK_ENGINE", raising=False)
+    assert _rerank_engine() == "onnx"
+
+
+def test_rerank_vllm_dispatches_to_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INGEST_SESSIONS_RERANK_ENGINE", "vllm")
+    captured: dict = {}
+
+    class _FakeResponse:
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            # Out-of-order rows to prove the caller re-sorts by "index".
+            body = {"data": [{"index": 1, "score": 0.7}, {"index": 0, "score": 0.9}]}
+            return json.dumps(body).encode()
+
+    def _fake_urlopen(req: object, timeout: float = 0) -> _FakeResponse:
+        captured["url"] = req.full_url  # type: ignore[attr-defined]
+        captured["body"] = json.loads(req.data)  # type: ignore[attr-defined]
+        return _FakeResponse()
+
+    import ingest_sessions.rerank as rerank_mod
+
+    monkeypatch.setattr(rerank_mod.urllib.request, "urlopen", _fake_urlopen)
+
+    scores = rerank("q", ["doc a", "doc b"])
+
+    assert captured["url"] == "http://127.0.0.1:8003/score"
+    assert captured["body"] == {
+        "model": "rerank-msmarco",
+        "text_1": "q",
+        "text_2": ["doc a", "doc b"],
+    }
+    assert scores == [0.9, 0.7]
+
+
+def test_rerank_vllm_respects_url_and_model_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INGEST_SESSIONS_RERANK_ENGINE", "vllm")
+    monkeypatch.setenv("INGEST_SESSIONS_RERANK_URL", "http://127.0.0.1:9999/score")
+    monkeypatch.setenv("INGEST_SESSIONS_RERANK_MODEL_NAME", "custom-rerank")
+    captured: dict = {}
+
+    class _FakeResponse:
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"data": [{"index": 0, "score": 1.0}]}).encode()
+
+    def _fake_urlopen(req: object, timeout: float = 0) -> _FakeResponse:
+        captured["url"] = req.full_url  # type: ignore[attr-defined]
+        captured["body"] = json.loads(req.data)  # type: ignore[attr-defined]
+        return _FakeResponse()
+
+    import ingest_sessions.rerank as rerank_mod
+
+    monkeypatch.setattr(rerank_mod.urllib.request, "urlopen", _fake_urlopen)
+
+    rerank("q", ["doc"])
+
+    assert captured["url"] == "http://127.0.0.1:9999/score"
+    assert captured["body"]["model"] == "custom-rerank"
+
+
+def test_rerank_vllm_empty_documents_skips_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INGEST_SESSIONS_RERANK_ENGINE", "vllm")
+
+    def _fail_urlopen(*args: object, **kwargs: object) -> None:
+        raise AssertionError("must not call the network for an empty document list")
+
+    import ingest_sessions.rerank as rerank_mod
+
+    monkeypatch.setattr(rerank_mod.urllib.request, "urlopen", _fail_urlopen)
+
+    assert rerank("q", []) == []

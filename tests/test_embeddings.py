@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import time
+from io import BytesIO
 
 import duckdb
+import pytest
 
 from ingest_sessions.embeddings import (
     EMBED_DIM,
+    _embed_engine,
     backfill_embeddings,
     embed_query,
     embed_texts,
@@ -139,3 +142,83 @@ def test_backfill_embedded_at_is_set(db: duckdb.DuckDBPyConnection) -> None:
     ts = _scalar(db, "SELECT embedded_at FROM record_embeddings WHERE uuid='x'")
     assert isinstance(ts, int)
     assert ts >= before
+
+
+# ---------------------------------------------------------------------------
+# engine selection (env INGEST_SESSIONS_EMBED_ENGINE) — mocked HTTP, no live
+# vLLM server required. See embeddings.py's docstring for the equivalence
+# check run against a real GPU server: cosine similarity 0.999999 against
+# fastembed's ONNX output on matched inputs.
+# ---------------------------------------------------------------------------
+
+
+def test_embed_engine_defaults_to_onnx(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("INGEST_SESSIONS_EMBED_ENGINE", raising=False)
+    assert _embed_engine() == "onnx"
+
+
+def test_embed_texts_vllm_dispatches_to_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INGEST_SESSIONS_EMBED_ENGINE", "vllm")
+    captured: dict = {}
+
+    class _FakeResponse:
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            # Two rows, deliberately returned out of index order to prove the
+            # caller re-sorts by "index" rather than trusting response order.
+            body = {
+                "data": [
+                    {"index": 1, "embedding": [0.2] * EMBED_DIM},
+                    {"index": 0, "embedding": [0.1] * EMBED_DIM},
+                ]
+            }
+            return json.dumps(body).encode()
+
+    def _fake_urlopen(req: object, timeout: float = 0) -> _FakeResponse:
+        captured["url"] = req.full_url  # type: ignore[attr-defined]
+        captured["body"] = json.loads(req.data)  # type: ignore[attr-defined]
+        return _FakeResponse()
+
+    import ingest_sessions.embeddings as embeddings_mod
+
+    monkeypatch.setattr(embeddings_mod.urllib.request, "urlopen", _fake_urlopen)
+
+    vecs = embed_texts(["first", "second"])
+
+    assert captured["url"] == "http://127.0.0.1:8002/v1/embeddings"
+    assert captured["body"] == {"model": "embed-minilm", "input": ["first", "second"]}
+    # Re-sorted by index: vecs[0] corresponds to "first" (index 0), not the
+    # first row the fake server happened to return.
+    assert vecs[0][0] == pytest.approx(0.1)
+    assert vecs[1][0] == pytest.approx(0.2)
+
+
+def test_embed_texts_vllm_respects_url_and_model_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INGEST_SESSIONS_EMBED_ENGINE", "vllm")
+    monkeypatch.setenv(
+        "INGEST_SESSIONS_EMBED_URL", "http://127.0.0.1:9999/v1/embeddings"
+    )
+    monkeypatch.setenv("INGEST_SESSIONS_EMBED_MODEL_NAME", "custom-embed")
+    captured: dict = {}
+
+    def _fake_urlopen(req: object, timeout: float = 0) -> BytesIO:
+        captured["url"] = req.full_url  # type: ignore[attr-defined]
+        captured["body"] = json.loads(req.data)  # type: ignore[attr-defined]
+        body = {"data": [{"index": 0, "embedding": [0.0] * EMBED_DIM}]}
+        return BytesIO(json.dumps(body).encode())
+
+    import ingest_sessions.embeddings as embeddings_mod
+
+    monkeypatch.setattr(embeddings_mod.urllib.request, "urlopen", _fake_urlopen)
+
+    embed_texts(["x"])
+
+    assert captured["url"] == "http://127.0.0.1:9999/v1/embeddings"
+    assert captured["body"]["model"] == "custom-embed"

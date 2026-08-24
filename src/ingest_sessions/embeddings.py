@@ -23,7 +23,9 @@ created on every connection alongside the rest of the tables.
 from __future__ import annotations
 
 import json
+import os
 import time
+import urllib.request
 from typing import TYPE_CHECKING, Any
 
 import duckdb
@@ -44,6 +46,35 @@ EMBED_DIM = 384
 _MODEL: TextEmbedding | None = None
 
 
+def _embed_engine() -> str:
+    """Which backend ``embed_texts`` uses (env ``INGEST_SESSIONS_EMBED_ENGINE``).
+
+    ``onnx`` (default) runs fastembed's CPU ONNX runtime in-process, unchanged
+    behavior. ``vllm`` calls a vLLM ``/v1/embeddings`` endpoint over HTTP —
+    the same ``EMBED_MODEL`` weights served on a GPU (pebble is-af8: CPU
+    inference was the bottleneck; onnxruntime has no working CUDA execution
+    provider on this host's Blackwell cards).
+
+    Both engines serve identical weights, so vectors from either land in the
+    same 384-dim space. Verified on matched inputs: cosine similarity
+    0.999999 between the two, safe to mix within one vector index without
+    re-embedding.
+    """
+    return os.environ.get("INGEST_SESSIONS_EMBED_ENGINE", "onnx")
+
+
+def _embed_url() -> str:
+    """vLLM embeddings endpoint (env ``INGEST_SESSIONS_EMBED_URL``)."""
+    return os.environ.get(
+        "INGEST_SESSIONS_EMBED_URL", "http://127.0.0.1:8002/v1/embeddings"
+    )
+
+
+def _embed_model_name() -> str:
+    """Served model name at the vLLM endpoint (env ``INGEST_SESSIONS_EMBED_MODEL_NAME``)."""
+    return os.environ.get("INGEST_SESSIONS_EMBED_MODEL_NAME", "embed-minilm")
+
+
 def _get_model() -> TextEmbedding:
     """Return the cached embedding model, instantiating it on first use."""
     global _MODEL
@@ -54,12 +85,42 @@ def _get_model() -> TextEmbedding:
     return _MODEL
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a batch of texts into ``EMBED_DIM``-length float vectors."""
-    if not texts:
-        return []
+def _embed_texts_onnx(texts: list[str]) -> list[list[float]]:
+    """Embed via the in-process fastembed ONNX model (CPU)."""
     model = _get_model()
     return [[float(x) for x in vec] for vec in model.embed(texts)]
+
+
+def _embed_texts_vllm(texts: list[str]) -> list[list[float]]:
+    """Embed via a vLLM ``/v1/embeddings`` endpoint (env ``INGEST_SESSIONS_EMBED_ENGINE=vllm``).
+
+    Raises on any transport or protocol error — callers get a clear failure
+    rather than a silent fall back to the wrong vector space.
+    """
+    body = json.dumps({"model": _embed_model_name(), "input": texts}).encode()
+    req = urllib.request.Request(
+        _embed_url(),
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        payload = json.loads(resp.read())
+    ordered = sorted(payload["data"], key=lambda d: d["index"])
+    return [[float(x) for x in d["embedding"]] for d in ordered]
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of texts into ``EMBED_DIM``-length float vectors.
+
+    Backend selected by ``INGEST_SESSIONS_EMBED_ENGINE`` (see
+    :func:`_embed_engine`): ``onnx`` (default) or ``vllm``.
+    """
+    if not texts:
+        return []
+    if _embed_engine() == "vllm":
+        return _embed_texts_vllm(texts)
+    return _embed_texts_onnx(texts)
 
 
 def embed_query(text: str) -> list[float]:
